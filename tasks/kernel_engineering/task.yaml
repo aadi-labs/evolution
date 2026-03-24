@@ -1,0 +1,15 @@
+name: kernel-engineering
+description: "Optimize GPU kernel implementation for minimum cycle count."
+metric:
+  name: cycles
+  direction: lower_is_better
+grader:
+  type: script
+  script: ./grader.py
+seed: ./seed/
+milestones:
+  baseline: 1363
+  target: 1103
+stop:
+  max_time: 6h
+  stagnation: 30m

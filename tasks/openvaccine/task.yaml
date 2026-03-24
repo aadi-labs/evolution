@@ -1,0 +1,15 @@
+name: stanford-openvaccine
+description: "Minimize MCRMSE on Stanford OpenVaccine RNA degradation prediction."
+metric:
+  name: mcrmse
+  direction: lower_is_better
+grader:
+  type: hybrid
+  script: ./grader.py
+  llm_feedback: true
+seed: ./seed/
+milestones:
+  baseline: 0.34198
+stop:
+  max_time: 8h
+  stagnation: 45m

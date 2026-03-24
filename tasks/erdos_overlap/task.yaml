@@ -1,0 +1,20 @@
+name: erdos-minimum-overlap
+description: "Minimize the overlap constant C5 for the Erdos Minimum Overlap Problem."
+metric:
+  name: C5
+  direction: lower_is_better
+grader:
+  type: hybrid
+  script: ./grader.py
+  llm_feedback: true
+seed: ./seed/
+milestones:
+  baseline: 0.38111
+  target: 0.38089
+  stretch: 0.3808703
+stop:
+  max_time: 6h
+  max_attempts: 200
+  stagnation: 30m
+  stagnation_action: shake_up
+  shake_up_budget: 2

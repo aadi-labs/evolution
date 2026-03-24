@@ -1,0 +1,26 @@
+# Evolution runtime
+.evolution/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Tools
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.claude/
+
+# OS
+.DS_Store
+
+# Logs
+firebase-debug.log
+
+# Lock
+uv.lock
