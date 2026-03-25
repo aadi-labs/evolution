@@ -239,3 +239,58 @@ def test_load_config_superagent_defaults():
 
     assert cfg.superagent.enabled is False
     assert cfg.superagent.runtime == "claude-code"
+
+
+# ---------- EvalQueueConfig ----------
+
+
+def test_eval_queue_config_defaults():
+    from evolution.manager.config import EvalQueueConfig
+    eq = EvalQueueConfig()
+    assert eq.concurrency == 1
+    assert eq.fairness == "round_robin"
+    assert eq.max_queued == 8
+    assert eq.rate_limit_seconds == 0
+    assert eq.priority_boost == "none"
+
+def test_task_config_with_eval_queue():
+    from evolution.manager.config import EvalQueueConfig, TaskConfig
+    tc = TaskConfig(
+        name="test", description="test", path=".", seed=".",
+        eval_queue=EvalQueueConfig(concurrency=2, max_queued=16),
+    )
+    assert tc.eval_queue.concurrency == 2
+    assert tc.eval_queue.max_queued == 16
+
+def test_task_config_without_eval_queue():
+    from evolution.manager.config import TaskConfig
+    tc = TaskConfig(name="test", description="test", path=".", seed=".")
+    assert tc.eval_queue is None
+
+
+# ---------- PhaseConfig ----------
+
+
+def test_phase_config():
+    from evolution.manager.config import PhaseConfig
+    p = PhaseConfig(name="research", duration="30m", eval_blocked=True)
+    assert p.name == "research"
+    assert p.eval_blocked is True
+
+def test_task_config_workspace_strategy_default():
+    from evolution.manager.config import TaskConfig
+    tc = TaskConfig(name="t", description="d", path=".", seed=".")
+    assert tc.workspace_strategy == "auto"
+
+def test_task_config_workspace_strategy_explicit():
+    from evolution.manager.config import TaskConfig
+    tc = TaskConfig(name="t", description="d", path=".", seed=".", workspace_strategy="reflink")
+    assert tc.workspace_strategy == "reflink"
+
+def test_task_config_with_phases():
+    from evolution.manager.config import PhaseConfig, TaskConfig
+    tc = TaskConfig(
+        name="test", description="test", path=".", seed=".",
+        phases=[PhaseConfig(name="research", duration="30m", eval_blocked=True)],
+    )
+    assert len(tc.phases) == 1

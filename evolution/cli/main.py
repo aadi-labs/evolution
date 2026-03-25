@@ -113,6 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_notes_list = notes_sub.add_parser("list", help="List notes")
     p_notes_list.add_argument("--agent", default=None, help="Filter by agent name")
+    p_notes_list.add_argument("--tag", default=None, help="Filter by tag")
 
     # -- skill (add) -------------------------------------------------------
     p_skill = subparsers.add_parser("skill", help="Manage skills")
@@ -163,8 +164,43 @@ def build_parser() -> argparse.ArgumentParser:
     p_spawn.add_argument("--role", default=None, help="Role for the new agent")
     p_spawn.add_argument("--runtime", default="claude-code", help="Runtime to use")
 
+    # -- claims ------------------------------------------------------------
+    subparsers.add_parser("claims", help="Show active work claims")
+
+    # -- diff --------------------------------------------------------------
+    p_diff = subparsers.add_parser("diff", help="Show agent's code changes")
+    p_diff.add_argument("agent", help="Agent name to diff")
+
+    # -- cherry-pick -------------------------------------------------------
+    p_cp = subparsers.add_parser("cherry-pick", help="Copy a file from another agent")
+    p_cp.add_argument("source_agent", help="Agent to copy from")
+    p_cp.add_argument("file", help="File path to copy")
+
     # -- stop --------------------------------------------------------------
     subparsers.add_parser("stop", help="Stop the evolution session")
+
+    # -- hypothesis (with sub-subcommands) ---------------------------------
+    p_hyp = subparsers.add_parser("hypothesis", help="Manage hypotheses")
+    hyp_sub = p_hyp.add_subparsers(dest="hypothesis_command")
+
+    p_hyp_add = hyp_sub.add_parser("add", help="Add a hypothesis")
+    p_hyp_add.add_argument("text", help="Hypothesis text")
+    p_hyp_add.add_argument("--metric", default="", help="Metric to track")
+
+    p_hyp_list = hyp_sub.add_parser("list", help="List hypotheses")
+    p_hyp_list.add_argument("--status", default=None, help="Filter by status (open/validated/invalidated)")
+
+    p_hyp_resolve = hyp_sub.add_parser("resolve", help="Resolve a hypothesis")
+    p_hyp_resolve.add_argument("id", help="Hypothesis ID (e.g., H-1)")
+    p_hyp_resolve.add_argument("--validated", action="store_true")
+    p_hyp_resolve.add_argument("--invalidated", action="store_true")
+    p_hyp_resolve.add_argument("--evidence", default="", help="Evidence for resolution")
+
+    # -- merge -------------------------------------------------------------
+    p_merge = subparsers.add_parser("merge", help="Create branch with winning agent's changes")
+    p_merge.add_argument("--agent", default=None, help="Agent to merge (default: best scoring)")
+    p_merge.add_argument("--branch", default="evolution/merge", help="Branch name to create")
+    p_merge.add_argument("--dry-run", action="store_true", help="Show changelog without creating branch")
 
     # -- report / export / timeline ----------------------------------------
     subparsers.add_parser("report", help="Generate a session report")
@@ -227,6 +263,8 @@ def main() -> None:
             request: dict = {"type": "notes_list"}
             if args.agent:
                 request["agent"] = args.agent
+            if args.tag:
+                request["tag"] = args.tag
             _send_and_print(socket_path, request)
         else:
             parser.parse_args(["notes", "--help"])
@@ -313,8 +351,51 @@ def main() -> None:
         request["runtime"] = args.runtime
         _send_and_print(socket_path, request)
 
+    elif args.command == "claims":
+        _send_and_print(socket_path, {"type": "claims"})
+
+    elif args.command == "diff":
+        _send_and_print(socket_path, {"type": "diff", "agent": args.agent})
+
+    elif args.command == "cherry-pick":
+        agent = _detect_agent_name()
+        _send_and_print(socket_path, {
+            "type": "cherry_pick",
+            "source_agent": args.source_agent,
+            "target_agent": agent or "",
+            "file": args.file,
+        })
+
     elif args.command == "stop":
         _send_and_print(socket_path, {"type": "stop"})
+
+    elif args.command == "hypothesis":
+        if getattr(args, "hypothesis_command", None) == "add":
+            agent = _detect_agent_name()
+            request = {"type": "hypothesis_add", "agent": agent or "", "hypothesis": args.text, "metric": args.metric}
+            _send_and_print(socket_path, request)
+        elif getattr(args, "hypothesis_command", None) == "list":
+            request: dict = {"type": "hypothesis_list"}
+            if args.status:
+                request["status"] = args.status
+            _send_and_print(socket_path, request)
+        elif getattr(args, "hypothesis_command", None) == "resolve":
+            agent = _detect_agent_name()
+            resolution = "validated" if args.validated else "invalidated" if args.invalidated else ""
+            request = {"type": "hypothesis_resolve", "id": args.id, "agent": agent or "", "resolution": resolution, "evidence": args.evidence}
+            _send_and_print(socket_path, request)
+        else:
+            parser.parse_args(["hypothesis", "--help"])
+
+    elif args.command == "merge":
+        request = {
+            "type": "merge",
+            "dry_run": args.dry_run,
+            "branch": args.branch,
+        }
+        if args.agent:
+            request["agent"] = args.agent
+        _send_and_print(socket_path, request)
 
     elif args.command == "report":
         _send_and_print(socket_path, {"type": "status"})

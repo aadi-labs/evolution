@@ -33,30 +33,63 @@ Agents can be **heterogeneous**: Claude Code, Codex, and OpenCode running simult
 
 ### 4. Shared Knowledge Layer
 
-Three types of persistent knowledge, stored as markdown files with YAML frontmatter in `.evolution/shared/`:
+Four types of persistent knowledge, stored as markdown files with YAML frontmatter in `.evolution/shared/`:
 
 **Attempts.** Every evaluation creates a record: score, description, grader feedback, timestamp. Agents read the leaderboard to understand what's working.
 
-**Notes.** Free-form observations that agents share: "WORKING ON: X" (claim work), "FINDING: Y" (share discovery), "DEAD END: Z" (warn others). This is how agents self-organize without a scheduler.
+**Notes.** Tagged observations that agents share: `WORKING ON: X` (claim work), `FINDING: Y` (share discovery), `DEAD END: Z` (warn others). Tags (`technique`, `dead-end`, `paper`, `competitor`) enable filtering: `evolution notes list --tag technique`. This is how agents self-organize without a scheduler.
 
 **Skills.** Reusable techniques that agents publish as markdown files. A skill might be "how to tune BM25 weights" or "optimal session chunking strategy." Skills persist across sessions.
 
+**Hypotheses.** Structured predictions that agents track through their lifecycle. An agent posts "BM25 weight > 0.5 hurts temporal reasoning," tests it, and resolves it as validated or invalidated with evidence. This prevents the collective from re-testing the same ideas.
+
 ### 5. Heartbeat Mechanism
 
-A configurable periodic interrupt, triggered by whichever comes first: N eval submissions or elapsed time. When fired, the manager delivers a reflection prompt to the agent's inbox.
+Multiple named heartbeats at different frequencies:
 
-This mechanism is critical. Without it, agents tend to fixate on their current approach, failing to step back and share what they've learned. The heartbeat forces externalization — agents must pause, reflect on the leaderboard, and decide whether to continue or pivot.
+```yaml
+heartbeat:
+  - name: reflect
+    every: 1        # after every eval
+  - name: consolidate
+    every: 5        # consolidate inbox into digest
+  - name: converge
+    every: 10       # rebase all worktrees to best agent's code
+```
+
+Each fires independently. Regular heartbeats (`reflect`, `consolidate`) force externalization — agents must pause, reflect on the leaderboard, and share what they've learned. The `converge` heartbeat triggers population-level convergence (see below).
+
+### 6. Eval Queue
+
+Eval submissions go through a serialized queue instead of grading immediately. A single worker thread drains the queue, running one grader at a time. This prevents resource exhaustion when grading is expensive.
+
+Agents submit and get back a queue position immediately — no blocking. Results arrive in their inbox. Round-robin fairness prevents flooding. Priority boost rewards improving agents with faster feedback.
+
+### 7. Convergence
+
+When the `converge` heartbeat fires, the manager resets all agent worktrees to the best-scoring agent's code via `git checkout`. Each agent's pre-convergence state is committed to git history — nothing is lost. Convergence refocuses the population on the most promising direction while preserving exploration freedom after the rebase.
+
+### 8. Session Chaining
+
+Sessions can build on previous sessions via `seed_from`. The new session loads the previous session's best code and accumulated memory (`shared/memory/`), but resets attempts, notes, and skills. Multi-day research becomes a series of focused sessions, each building on the last.
 
 ## Workspace Isolation
 
-Each agent gets a **git worktree** — a real branch (`evolution/<agent-name>`) checked out at `.evolution/worktrees/<name>/`. This provides:
+Evolution auto-detects the best workspace strategy for the filesystem:
 
-- Full file isolation (agents can't interfere with each other)
-- Git history per agent (`git diff`, `git log`, `git stash`)
-- Per-worktree index (no lock contention)
-- Disk efficiency (git worktrees share the object store)
+### Path A: Copy-on-Write (APFS, btrfs, XFS)
 
-Untracked directories agents need (`.venv`, `node_modules`, datasets) are symlinked from the main repo. The shared knowledge directory is symlinked into every worktree.
+On filesystems that support reflink, the entire repo is cloned using `cp -c` (macOS) or `cp --reflink=always` (Linux). Files share physical blocks until modified — near-zero disk cost. The copy is parallelized across a thread pool with file descriptor throttling (semaphore at 200, staying under macOS's default ulimit of 256).
+
+Agents get everything: source code, `.venv`, `node_modules`, build caches, configs. No dependency reinstall. No symlink fragility. `.git/` and `.evolution/` are excluded — agents use `evolution diff` instead of direct git commands.
+
+### Path B: Git Worktree + Auto-Symlink (ext4, NTFS)
+
+On filesystems without reflink, agents get git worktrees (`git worktree add` on branch `evolution/<agent-name>`). Gitignored directories are auto-discovered via `git ls-files --others --ignored --exclude-standard --directory` and symlinked — no hardcoded list. Whatever your project ignores (`.venv`, `node_modules`, `target/`, `.next/`, `__pycache__/`), it's found and shared.
+
+### Both Paths
+
+After creation, a background thread warms the OS disk cache by walking the worktree. This makes subsequent file operations from agents near-instant.
 
 ```
 .evolution/
@@ -64,8 +97,9 @@ Untracked directories agents need (`.venv`, `node_modules`, datasets) are symlin
 ├── state.json                # Session state (for resume)
 ├── shared/
 │   ├── attempts/             # Eval records (markdown + YAML frontmatter)
-│   ├── notes/                # Agent observations
+│   ├── notes/                # Agent observations (tagged)
 │   ├── skills/               # Reusable techniques
+│   ├── hypotheses/           # Structured predictions with evidence
 │   ├── configs/              # Config snapshots per attempt
 │   └── memory/               # Persistent cross-session insights
 └── worktrees/
@@ -80,11 +114,32 @@ Untracked directories agents need (`.venv`, `node_modules`, datasets) are symlin
         └── ...
 ```
 
-## Message Delivery
+## Message Delivery and Inbox
 
-Messages (heartbeats, human commands, milestone notifications) are delivered as timestamped markdown files in each agent's inbox at `.evolution/worktrees/<agent>/.evolution/inbox/`.
+Messages are delivered as timestamped markdown files in each agent's inbox at `.evolution/worktrees/<agent>/.evolution/inbox/`.
 
-Agents check their inbox before starting new work and after each eval submission. This filesystem-based approach works across all runtimes — no stdin injection or API calls needed.
+The inbox is the **single source of truth** for live session state. The manager writes to all inboxes on every state change:
+
+- `[LEADERBOARD]` — after every eval, with top-3 scores
+- `[CLAIM]` — when an agent posts a "WORKING ON" note
+- `[MILESTONE]` — when a score threshold is hit
+- `[CONVERGE]` — when worktrees are rebased to the best agent
+- `[PHASE]` — when a session phase transitions
+- `[EVAL RESULT]` — grading results (when using the eval queue)
+
+On heartbeat, the manager **consolidates** the inbox — all individual messages are merged into a single `DIGEST-<timestamp>.md` file, preventing bloat during active sessions.
+
+Agents check their inbox before every action. This filesystem-based approach works across all runtimes — no stdin injection or API calls needed.
+
+## Agent Visibility
+
+Agents can see and steal each other's work:
+
+- **`evolution claims`** — see what every agent is currently working on
+- **`evolution diff <agent>`** — see another agent's code changes vs HEAD
+- **`evolution cherry-pick <agent> <file>`** — copy a specific file from another agent's worktree (with path traversal safety)
+
+This turns knowledge sharing from notes-only (text descriptions of what someone did) to code-level (see exactly what they changed, steal the file that works).
 
 ## Stagnation Detection
 

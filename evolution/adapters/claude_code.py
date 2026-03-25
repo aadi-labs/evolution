@@ -20,17 +20,23 @@ INSTRUCTION_TEMPLATE = """\
 {task_description}
 
 ## How to Work
+- **Before every action**, read `.evolution/inbox/` for new messages. This is NOT optional.
+  Inbox contains leaderboard updates, work claims from other agents, and directives from the session manager.
 - Make changes to the code in this directory
 - Submit with: `evolution eval -m "description of what you changed"`
+- Check who's working on what: `evolution claims`
+- See another agent's changes: `evolution diff <agent-name>`
+- Steal a good file: `evolution cherry-pick <agent-name> <file>`
+- Share insights: `evolution note add "your insight" --tags technique`
+- Share dead ends: `evolution note add "what failed" --tags dead-end`
+- Check open hypotheses: `evolution hypothesis list --status open`
 - Read others' work: `evolution attempts list`, `evolution notes list`
-- Share insights: `evolution note add "your insight"`
 - Publish reusable techniques: `evolution skill add skill-name.md`
-- Check your inbox before each new approach: `.evolution/inbox/`
-- Check your inbox after each eval submission
 
 ## Constraints
 - You will receive heartbeat prompts — reflect and share when asked
 - Prioritize messages from the user over your current work
+- Check .evolution/inbox/ after each eval submission for results and updates
 """
 
 

@@ -28,6 +28,8 @@ The platform handles the infrastructure: isolated workspaces, evaluation pipelin
 - Submit evaluations and receive scores + feedback
 - Share findings ("this worked", "this is a dead end", "try this technique")
 - Read each other's notes to avoid duplicating work
+- Diff and cherry-pick files from each other's worktrees
+- Track and test hypotheses with structured evidence
 - Respond to heartbeat prompts that force reflection and knowledge consolidation
 
 ## How It Works
@@ -63,30 +65,44 @@ The platform handles the infrastructure: isolated workspaces, evaluation pipelin
 
 **3. Agent Pool.** Multiple homogeneous or heterogeneous agents run as autonomous subprocesses. Each follows the same high-level loop — research, plan, implement, evaluate, reflect, repeat — but chooses its own strategy. Agents can be heterogeneous: Claude Code, Codex, and OpenCode running simultaneously on the same problem.
 
-**4. Shared Knowledge Layer.** Three types of persistent knowledge, stored as markdown files with YAML frontmatter:
+**4. Shared Knowledge Layer.** Four types of persistent knowledge, stored as markdown files with YAML frontmatter:
 - **Attempts** — every evaluation with score, description, and grader feedback
-- **Notes** — agent observations, findings, warnings, and proposals
+- **Notes** — agent observations, findings, warnings, and proposals (with structured tags: `technique`, `dead-end`, `paper`, `competitor`)
 - **Skills** — reusable techniques that agents publish for others
+- **Hypotheses** — structured predictions that agents track, test, and resolve with evidence
 
-**5. Heartbeat Mechanism.** A configurable periodic interrupt (triggered by time or attempt count) that forces agents to pause, reflect on progress, and share what they've learned. Without this, agents tend to fixate on their current approach and fail to externalize useful discoveries.
+**5. Heartbeat Mechanism.** Multiple named heartbeats at different frequencies — `reflect` after every eval, `consolidate` every 5, `converge` every 10. Each fires independently. The `converge` heartbeat triggers population-level convergence: all agents rebase to the best-scoring agent's code. Regular heartbeats force reflection and knowledge sharing.
 
 ## The Agent Loop
 
 Each agent runs autonomously:
 
 ```
-1. Read shared memory and notes from other agents
-2. Claim work: "WORKING ON: improving temporal reasoning"
-3. Research: read papers, explore the codebase, study competitors
-4. Implement: make targeted changes
-5. Test: run the test suite, verify no regressions
-6. Evaluate: submit with `evolution eval -m "description"`
-7. Share: post findings, warn about dead ends, publish techniques
-8. Reflect: read the leaderboard, adjust strategy
-9. Repeat
+1. Check inbox for leaderboard updates, claims, and directives
+2. Check open hypotheses: evolution hypothesis list --status open
+3. Check claims: evolution claims (see what others are working on)
+4. Claim work: evolution note add "WORKING ON: X" --tags working-on
+5. Research: read papers, diff other agents, cherry-pick good files
+6. Implement: make targeted changes
+7. Test: run the test suite, verify no regressions
+8. Evaluate: evolution eval -m "description" (queued, non-blocking)
+9. Share: post findings, resolve hypotheses, warn about dead ends
+10. Repeat
 ```
 
 Agents communicate through the shared knowledge hub, not direct messaging. This creates a naturally asynchronous collaboration pattern — agents don't block each other, and late-joining agents can catch up by reading the accumulated knowledge.
+
+## Cross-Pollination
+
+Agents can see and steal each other's work:
+
+```bash
+evolution claims                              # who's working on what?
+evolution diff agent-2                        # what did agent-2 change?
+evolution cherry-pick agent-1 src/retriever.py  # copy agent-1's file into my worktree
+```
+
+This solves the biggest problem in multi-agent sessions: agents rebuilding what someone else already built. With `diff` and `cherry-pick`, good implementations propagate across the pool without requiring agents to read each other's notes.
 
 ## Human-in-the-Loop
 
@@ -111,6 +127,23 @@ evolution kill agent-4           # Remove an agent entirely
 evolution stop
 ```
 
+## Merging the Winner
+
+When the session ends, merge the best agent's work into a branch:
+
+```bash
+# Preview what would be merged
+evolution merge --dry-run
+
+# Create a branch with the winning agent's changes + changelog
+evolution merge --branch evolution/my-feature
+
+# Merge a specific agent (not just the best)
+evolution merge --agent agent-3 --branch evolution/agent-3-approach
+```
+
+The merge command creates a new branch from HEAD, copies the winning agent's changed files, and commits with a **generated changelog** — top attempts, key findings from notes, and hypothesis resolutions. You can then review the branch and open a PR.
+
 ## The Best Way to Run Evolution
 
 The recommended way to run Evolution is to let a Claude Code instance manage the session for you. Tell it to start `evolution run`, monitor progress, and nudge agents toward the goal. Claude Code becomes your **superagent** — it reads the leaderboard, checks agent notes, sends course corrections, and escalates when something needs your attention.
@@ -118,6 +151,68 @@ The recommended way to run Evolution is to let a Claude Code instance manage the
 This matters because Claude Code supports remote control. Once the session is running, you can connect from your phone, a tablet, or any browser — check scores, send messages to agents, pause or spawn new ones. You don't need to be at your desk. A 48-hour evolution session becomes something you can steer from anywhere.
 
 Evolution runs fine without steering too. Agents are autonomous and will make progress on their own. But human guidance at key moments — "stop using Chroma, switch to turbopuffer" or "retrieval isn't the bottleneck, focus on answer quality" — can save hours of wasted exploration. The superagent pattern gives you that leverage without requiring constant attention.
+
+## Convergence
+
+Every N evals, the `converge` heartbeat fires. The manager identifies the best-scoring agent and resets all other worktrees to that agent's code. Agents keep their git history — they can `git diff HEAD~1` to see what changed. But they're now all building from the best-known baseline.
+
+Without convergence, agents diverge indefinitely. One agent might spend 20 attempts improving fundamentally worse code. Convergence refocuses the population on the most promising direction while preserving exploration freedom after the rebase.
+
+## Research Phases
+
+Sessions can define a **research phase** where eval submissions are blocked:
+
+```yaml
+task:
+  phases:
+    - name: research
+      duration: 30m
+      eval_blocked: true
+      prompt: "Research only. Read papers, study competitors. Share findings."
+    - name: evolve
+```
+
+During the research phase, agents explore the problem space and share structured notes (`--tags paper,technique,competitor`). When the phase ends, they transition to implementation with a shared understanding of the landscape. This prevents the "everyone jumps to coding" problem.
+
+## Hypothesis Tracking
+
+Agents can post structured hypotheses and resolve them with evidence:
+
+```bash
+evolution hypothesis add "Higher BM25 weight improves KU recall" --metric ku_score
+evolution hypothesis list --status open
+evolution hypothesis resolve H-1 --validated --evidence "Attempt #12: KU 71% → 78%"
+```
+
+This prevents agents from re-testing the same ideas. Open hypotheses are visible to all agents — "H-3 is untested, let me try it" instead of independently discovering the same question.
+
+## Eval Queue
+
+Eval submissions go through a **serialized queue** instead of running graders immediately. This prevents resource exhaustion when grading is expensive (GPU, API calls, large datasets).
+
+```yaml
+task:
+  eval_queue:
+    concurrency: 1
+    fairness: round_robin
+    max_queued: 8
+    rate_limit_seconds: 300
+    priority_boost: improving
+```
+
+Agents submit and get back a queue position immediately — no blocking. Results arrive in their inbox when grading completes. Round-robin fairness prevents any single agent from flooding the queue. Priority boost rewards agents on an improvement streak with faster feedback.
+
+## Session Chaining
+
+Multi-day research becomes a series of focused sessions, each building on the last:
+
+```yaml
+session:
+  name: lattice-v5
+  seed_from: lattice-v4
+```
+
+When `seed_from` is set, the new session loads the previous session's best code and accumulated memory (`.evolution/shared/memory/`). Attempts, notes, and skills reset fresh — no stale context. The knowledge graph grows across sessions while the agent pool starts clean.
 
 ## Stagnation and Shake-Up
 
@@ -151,6 +246,7 @@ Everything lives in `evolution.yaml`:
 ```yaml
 session:
   name: my-project
+  seed_from: my-project-v1   # optional: build on previous session
 
 task:
   name: optimize-score
@@ -167,6 +263,21 @@ task:
     baseline: 0.65
     target: 0.90
     stretch: 0.99
+
+  phases:                      # optional: structured research before coding
+    - name: research
+      duration: 30m
+      eval_blocked: true
+      prompt: "Research only. Share findings with evolution note add --tags technique."
+    - name: evolve
+
+  eval_queue:                  # optional: queued evaluation
+    concurrency: 1
+    fairness: round_robin
+    max_queued: 8
+    rate_limit_seconds: 300
+    priority_boost: improving
+
   stop:
     max_time: 6h
     stagnation: 1h
@@ -176,12 +287,16 @@ task:
 roles:
   researcher:
     prompt: |
-      You are a research agent. Your loop:
-      research -> implement -> test -> eval -> share -> repeat.
+      You are a research agent. Check inbox before every action.
+      Use evolution claims, diff, cherry-pick to learn from others.
+      Track hypotheses. Share findings with structured tags.
     heartbeat:
-      on_attempts: 3
-      on_time: 10m
-      strategy: first
+      - name: reflect
+        every: 1
+      - name: consolidate
+        every: 5
+      - name: converge
+        every: 10
 
 agents:
   agent-1:
@@ -204,9 +319,18 @@ See [docs/configuration.md](docs/configuration.md) for the full schema reference
 
 ## Workspace Isolation
 
-Each agent gets its own git worktree — a real branch (`evolution/<agent-name>`) checked out in `.evolution/worktrees/<name>/`. Untracked directories (`.venv`, `node_modules`, datasets) are symlinked from the main repo to save disk space.
+Each agent gets its own isolated copy of the repo at `.evolution/worktrees/<name>/`. Evolution auto-detects the best strategy for your filesystem:
 
-Git worktrees mean agents get `git diff`, `git log`, and `git stash` for free. Each worktree has its own index — no lock contention between agents.
+**On macOS (APFS) and Linux (btrfs/XFS):** Copy-on-write cloning via `cp -c` / `cp --reflink=always`. The entire repo — source code, `.venv`, `node_modules`, build caches, configs — is cloned at near-zero disk cost. Files share physical blocks until an agent modifies them. Agents start working immediately with all dependencies in place.
+
+**On Linux (ext4) and Windows (NTFS):** Git worktrees with auto-discovered symlinks. Git-tracked files are checked out on a new branch. Gitignored directories (`.venv`, `node_modules`, `target/`, `.next/`, etc.) are discovered automatically via `git ls-files --ignored` and symlinked — no hardcoded list.
+
+Both paths warm the OS disk cache in a background thread after creation, so `grep`, `find`, and file reads from agents are fast from the start.
+
+```yaml
+task:
+  workspace_strategy: auto   # auto | reflink | git_worktree (default: auto)
+```
 
 The shared knowledge directory (`.evolution/shared/`) is symlinked into every worktree so agents can read each other's attempts, notes, and skills.
 
@@ -262,13 +386,13 @@ evolution/
 ├── evolution/
 │   ├── cli/           # CLI commands (init, run, eval, note, msg, ...)
 │   ├── manager/       # Core orchestrator, config, heartbeat, socket server
-│   ├── workspace/     # Git worktree creation and lifecycle
+│   ├── workspace/     # Adaptive workspace: reflink CoW or git worktree
 │   ├── hub/           # Shared knowledge: attempts, notes, skills
 │   ├── grader/        # Script, LLM, hybrid, and multi-metric grading
 │   ├── adapters/      # Runtime adapters: Claude Code, Codex, OpenCode
 │   └── superagent/    # Remote control agent
 ├── tasks/             # Example benchmark tasks
-├── tests/             # 235 tests
+├── tests/             # 312 tests
 ├── docs/              # Architecture, configuration, CLI reference
 └── pyproject.toml
 ```

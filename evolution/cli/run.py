@@ -66,9 +66,30 @@ def cmd_run(args) -> None:
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
+    # Start eval worker thread if queue is configured
+    eval_worker_thread = None
+    if manager._eval_queue is not None:
+        def _eval_worker():
+            while not stop_event.is_set():
+                entry = manager._eval_queue.get()
+                if entry is None:
+                    stop_event.wait(timeout=2)
+                    continue
+                try:
+                    manager.grade_and_record(entry["agent"], entry["description"])
+                except Exception as exc:
+                    logger.error("Eval worker error for %s: %s", entry["agent"], exc)
+
+        eval_worker_thread = threading.Thread(target=_eval_worker, daemon=True)
+        eval_worker_thread.start()
+        print(f"  Eval worker started (queue capacity: {manager.config.task.eval_queue.max_queued})")
+
     # Manager loop
     try:
         while not stop_event.is_set():
+            # Check phase transitions
+            manager.check_phase_transition()
+
             # Check stop conditions
             reason = manager.check_stop_conditions()
             if reason:
@@ -98,10 +119,43 @@ def cmd_run(args) -> None:
                             except Exception as exc:
                                 logger.error("Failed to restart agent %s: %s", name, exc)
 
-                # Check heartbeats
-                if runtime.heartbeat.should_fire():
+                # Check heartbeats — named list or legacy single
+                if runtime.multi_heartbeat is not None:
+                    pending = runtime.multi_heartbeat.get_pending()
+                    for hb_name in pending:
+                        logger.info(
+                            "Heartbeat '%s' fired for agent %s", hb_name, name
+                        )
+                        if hb_name == "converge":
+                            manager.do_converge()
+                            continue
+                        if runtime.worktree_path:
+                            adapter = ADAPTERS.get(runtime.agent_config.runtime)
+                            if adapter:
+                                adapter().deliver_message(
+                                    runtime.worktree_path,
+                                    "manager",
+                                    f"HEARTBEAT [{hb_name}]: Time to {hb_name}. "
+                                    f"Check the leaderboard (evolution attempts list), "
+                                    f"read shared notes (evolution notes list), "
+                                    f"and share what you've learned.",
+                                )
+                                adapter().consolidate_inbox(runtime.worktree_path)
+                elif runtime.heartbeat is not None and runtime.heartbeat.should_fire():
                     runtime.heartbeat.reset()
                     logger.info("Heartbeat fired for agent %s", name)
+                    if runtime.worktree_path:
+                        adapter = ADAPTERS.get(runtime.agent_config.runtime)
+                        if adapter:
+                            adapter().deliver_message(
+                                runtime.worktree_path,
+                                "manager",
+                                "HEARTBEAT: Pause and reflect. "
+                                "Check the leaderboard (evolution attempts list), "
+                                "read shared notes (evolution notes list), "
+                                "and share what you've learned.",
+                            )
+                            adapter().consolidate_inbox(runtime.worktree_path)
 
             # Persist state
             manager.save_state()
@@ -125,5 +179,6 @@ def cmd_run(args) -> None:
                     except Exception:
                         pass
 
+        manager.archive_session()
         manager.save_state()
         print("Evolution session stopped.")

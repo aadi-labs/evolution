@@ -8,8 +8,9 @@ Evolution sessions are configured via a single `evolution.yaml` file. Generate o
 
 ```yaml
 session:
-  name: string       # Session identifier (required)
-  log_level: string  # debug | info | warning | error (default: info)
+  name: string              # Session identifier (required)
+  log_level: string         # debug | info | warning | error (default: info)
+  seed_from: string | null  # Previous session name for chaining (default: null)
 ```
 
 ### task
@@ -53,6 +54,22 @@ task:
     shake_up_budget: 2      # Shake-ups before hard stop (default: 2)
     manual: true            # Allow `evolution stop` (default: true)
     milestone_stop: target  # Stop when this milestone is reached (optional)
+
+  # Session phases (optional)
+  phases:
+    - name: research         # Phase name
+      duration: 30m          # Phase duration (optional — runs until next phase if unset)
+      eval_blocked: true     # Block eval submissions during this phase (default: false)
+      prompt: "..."          # Override role prompt during this phase (optional)
+    - name: evolve           # Final phase (no duration = runs until session ends)
+
+  # Eval queue (optional — without this, evals grade synchronously)
+  eval_queue:
+    concurrency: 1           # Graders running in parallel (default: 1)
+    fairness: round_robin    # fifo | round_robin | priority (default: round_robin)
+    max_queued: 8            # Max pending evals before rejection (default: 8)
+    rate_limit_seconds: 300  # Min seconds between evals per agent (default: 0 = no limit)
+    priority_boost: improving # none | improving (default: none)
 ```
 
 ### roles
@@ -64,10 +81,21 @@ roles:
   researcher:
     prompt: |
       You are a research agent. Explore, implement, evaluate, share.
+
+    # Legacy format (single heartbeat)
     heartbeat:
-      on_attempts: 3        # Fire after N evals (default: 3)
-      on_time: 10m          # Fire after duration (default: 10m)
-      strategy: first       # first = whichever triggers first
+      on_attempts: 3
+      on_time: 10m
+      strategy: first
+
+    # Named list format (multiple heartbeats at different frequencies)
+    heartbeat:
+      - name: reflect
+        every: 1           # after every eval
+      - name: consolidate
+        every: 5           # consolidate inbox every 5 evals
+      - name: converge
+        every: 10          # rebase to best agent every 10 evals
 ```
 
 ### agents
@@ -155,12 +183,21 @@ When using multiple metrics, Evolution supports four ranking strategies:
 
 Agents inherit the parent process environment. The `env` field in agent config adds or overrides specific variables. Sensitive values (API keys) should be in the parent shell environment or a `.env` file in the repo.
 
-## Workspace Symlinks
+## Workspace Strategy
 
-Each agent gets a git worktree (`git worktree add`). Git-tracked files are checked out automatically. Untracked directories that agents need are symlinked from the main repo:
+Evolution auto-detects the best workspace strategy. Override with:
 
-- `.venv`, `node_modules`
-- Project-specific data directories
-- `references`
+```yaml
+task:
+  workspace_strategy: auto        # auto | reflink | git_worktree
+```
 
-To customize, edit `SYMLINK_UNTRACKED` in `evolution/workspace/setup.py`.
+| Strategy | When Used | What Agents Get |
+|----------|-----------|-----------------|
+| `reflink` | APFS (macOS), btrfs/XFS (Linux) | Full copy-on-write clone — source, deps, caches. Near-zero disk cost. |
+| `git_worktree` | ext4 (Linux), NTFS (Windows) | Git worktree + auto-discovered symlinks for gitignored dirs. |
+| `auto` | Default | Tries reflink first, falls back to git worktree. |
+
+With `auto`, Evolution probes the filesystem at session start by attempting a reflink copy of a test file. The result is cached for all agents in the session.
+
+**Git worktree symlink discovery:** Instead of a hardcoded list, Evolution runs `git ls-files --others --ignored --exclude-standard --directory` to find all gitignored directories that exist (`.venv`, `node_modules`, `target/`, `.next/`, etc.) and symlinks them automatically.

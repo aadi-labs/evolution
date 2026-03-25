@@ -106,6 +106,7 @@ def evo_config(grader_script, seed_dir):
                 stagnation="10m",
                 stagnation_action="stop",
             ),
+            workspace_strategy="git_worktree",
         ),
         roles={
             "explorer": RoleConfig(
@@ -179,6 +180,78 @@ class TestHeartbeatTracker:
         assert hb.should_fire()
         hb.reset()
         assert not hb.should_fire()
+
+
+class TestMultiHeartbeat:
+    def test_different_frequencies(self):
+        from evolution.manager.heartbeat import MultiHeartbeatTracker
+
+        mhb = MultiHeartbeatTracker([
+            {"name": "reflect", "every": 1},
+            {"name": "consolidate", "every": 3},
+        ])
+
+        # After 1 attempt: reflect fires, consolidate doesn't
+        mhb.record_attempt()
+        pending = mhb.get_pending()
+        assert "reflect" in pending
+        assert "consolidate" not in pending
+
+        # After 2 more (total 2 since reflect reset): reflect fires again
+        mhb.record_attempt()
+        pending = mhb.get_pending()
+        assert "reflect" in pending
+        assert "consolidate" not in pending
+
+        # After 1 more (consolidate has seen 3 total): both fire
+        mhb.record_attempt()
+        pending = mhb.get_pending()
+        assert "reflect" in pending
+        assert "consolidate" in pending
+
+    def test_empty_heartbeats(self):
+        from evolution.manager.heartbeat import MultiHeartbeatTracker
+
+        mhb = MultiHeartbeatTracker([])
+        mhb.record_attempt()
+        assert mhb.get_pending() == []
+
+    def test_named_heartbeat_config_in_role(self):
+        from evolution.manager.config import NamedHeartbeatConfig, RoleConfig
+
+        role = RoleConfig(
+            prompt="test",
+            heartbeat=[
+                NamedHeartbeatConfig(name="reflect", every=1),
+                NamedHeartbeatConfig(name="consolidate", every=10),
+            ],
+        )
+        assert isinstance(role.heartbeat, list)
+        assert role.heartbeat[0].name == "reflect"
+        assert role.heartbeat[1].every == 10
+
+    def test_runtime_with_multi_heartbeat(self):
+        from evolution.manager.config import AgentConfig, NamedHeartbeatConfig, RoleConfig
+        from evolution.manager.runtime import AgentRuntime
+
+        role = RoleConfig(
+            prompt="test",
+            heartbeat=[
+                NamedHeartbeatConfig(name="reflect", every=2),
+                NamedHeartbeatConfig(name="consolidate", every=5),
+            ],
+        )
+        agent_cfg = AgentConfig(role="test", runtime="claude-code")
+        rt = AgentRuntime("agent-1", agent_cfg, role)
+
+        assert rt.multi_heartbeat is not None
+        assert rt.heartbeat is None
+
+        rt.multi_heartbeat.record_attempt()
+        rt.multi_heartbeat.record_attempt()
+        pending = rt.multi_heartbeat.get_pending()
+        assert "reflect" in pending
+        assert "consolidate" not in pending
 
 
 # =========================================================================
@@ -582,3 +655,509 @@ class TestManagerIntegration:
         assert response["status"] == "ok"
         assert "alpha" in response["agents"]
         assert response["total_attempts"] == 0
+
+
+# =========================================================================
+# EvalQueue integration tests
+# =========================================================================
+
+
+class TestInboxBroadcasts:
+    def test_eval_broadcasts_leaderboard(self, git_repo, evo_config):
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        mgr.handle_request({"type": "eval", "agent": "alpha", "description": "test"})
+        rt = mgr.agents["alpha"]
+        inbox = rt.worktree_path / ".evolution" / "inbox"
+        messages = list(inbox.glob("*.md"))
+        leaderboard_msgs = [m for m in messages if "[LEADERBOARD]" in m.read_text()]
+        assert len(leaderboard_msgs) >= 1
+
+    def test_note_broadcasts_claim(self, git_repo, evo_config):
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        mgr.handle_request({
+            "type": "note", "agent": "alpha",
+            "text": "WORKING ON: retrieval improvements",
+            "tags": ["working-on"],
+        })
+        rt = mgr.agents["alpha"]
+        inbox = rt.worktree_path / ".evolution" / "inbox"
+        messages = list(inbox.glob("*.md"))
+        claim_msgs = [m for m in messages if "[CLAIM]" in m.read_text()]
+        assert len(claim_msgs) >= 1
+
+    def test_milestone_broadcasts_with_prefix(self, git_repo, evo_config):
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        # Score of 1.0 should hit baseline (0.5) and target (1.0) milestones
+        mgr.handle_request({"type": "eval", "agent": "alpha", "description": "test"})
+        rt = mgr.agents["alpha"]
+        inbox = rt.worktree_path / ".evolution" / "inbox"
+        messages = list(inbox.glob("*.md"))
+        milestone_msgs = [m for m in messages if "[MILESTONE]" in m.read_text()]
+        assert len(milestone_msgs) >= 1
+
+
+class TestManagerEvalQueue:
+    def test_eval_returns_queued_when_configured(self, git_repo, evo_config):
+        from evolution.manager.config import EvalQueueConfig
+        evo_config.task.eval_queue = EvalQueueConfig(max_queued=8)
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        result = mgr.handle_request({"type": "eval", "agent": "alpha", "description": "test"})
+        assert result["status"] == "queued"
+        assert result["position"] == 1
+
+    def test_eval_synchronous_when_no_queue(self, git_repo, evo_config):
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        result = mgr.handle_request({"type": "eval", "agent": "alpha", "description": "test"})
+        assert result["status"] == "ok"
+        assert "score" in result
+
+
+# =========================================================================
+# Inbox Consolidation tests
+# =========================================================================
+
+
+class TestManagerClaims:
+    def test_claims_returns_active(self, git_repo, evo_config):
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        mgr.handle_request({
+            "type": "note", "agent": "alpha",
+            "text": "WORKING ON: retrieval improvements",
+            "tags": ["working-on"],
+        })
+        result = mgr.handle_request({"type": "claims"})
+        assert result["status"] == "ok"
+        assert len(result["claims"]) == 1
+        assert result["claims"][0]["agent"] == "alpha"
+
+    def test_claims_excludes_done(self, git_repo, evo_config):
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        mgr.handle_request({
+            "type": "note", "agent": "alpha",
+            "text": "WORKING ON: retrieval",
+            "tags": ["working-on"],
+        })
+        mgr.handle_request({
+            "type": "note", "agent": "alpha",
+            "text": "DONE: retrieval",
+            "tags": ["done"],
+        })
+        result = mgr.handle_request({"type": "claims"})
+        assert len(result["claims"]) == 0
+
+    def test_claims_multiple_agents(self, git_repo, evo_config):
+        evo_config.agents["beta"] = AgentConfig(role="explorer", runtime="claude-code")
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        mgr.handle_request({"type": "note", "agent": "alpha", "text": "WORKING ON: retrieval", "tags": ["working-on"]})
+        mgr.handle_request({"type": "note", "agent": "beta", "text": "WORKING ON: answer quality", "tags": ["working-on"]})
+        result = mgr.handle_request({"type": "claims"})
+        assert len(result["claims"]) == 2
+
+
+class TestManagerDiff:
+    def test_diff_returns_changes(self, git_repo, evo_config):
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        rt = mgr.agents["alpha"]
+        # Make a change in the worktree
+        (rt.worktree_path / "README.md").write_text("# Modified by alpha")
+        result = mgr.handle_request({"type": "diff", "agent": "alpha"})
+        assert result["status"] == "ok"
+        assert "Modified" in result["diff"]
+
+    def test_diff_unknown_agent(self, git_repo, evo_config):
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        result = mgr.handle_request({"type": "diff", "agent": "nonexistent"})
+        assert "error" in result
+
+    def test_diff_no_changes(self, git_repo, evo_config):
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        result = mgr.handle_request({"type": "diff", "agent": "alpha"})
+        assert result["status"] == "ok"
+        assert result["diff"] == "" or result["diff"].strip() == ""
+
+
+class TestManagerDiffReflink:
+    def test_diff_without_git_dir(self, git_repo, evo_config):
+        """Diff should work even when worktree has no .git (reflink path)."""
+        evo_config.task.workspace_strategy = "reflink"
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        rt = mgr.agents["alpha"]
+        # Modify a file
+        (rt.worktree_path / "README.md").write_text("# Modified by alpha")
+        result = mgr.handle_request({"type": "diff", "agent": "alpha"})
+        assert result["status"] == "ok"
+        # Should show some diff content
+        assert len(result["diff"]) > 0
+
+
+class TestManagerCherryPick:
+    def test_cherry_pick_copies_file(self, git_repo, evo_config):
+        evo_config.agents["beta"] = AgentConfig(role="explorer", runtime="claude-code")
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        alpha_rt = mgr.agents["alpha"]
+        (alpha_rt.worktree_path / "new_file.py").write_text("print('hello')")
+        result = mgr.handle_request({
+            "type": "cherry_pick",
+            "source_agent": "alpha",
+            "target_agent": "beta",
+            "file": "new_file.py",
+        })
+        assert result["status"] == "ok"
+        beta_rt = mgr.agents["beta"]
+        assert (beta_rt.worktree_path / "new_file.py").read_text() == "print('hello')"
+
+    def test_cherry_pick_creates_parent_dirs(self, git_repo, evo_config):
+        evo_config.agents["beta"] = AgentConfig(role="explorer", runtime="claude-code")
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        alpha_rt = mgr.agents["alpha"]
+        deep = alpha_rt.worktree_path / "src" / "deep"
+        deep.mkdir(parents=True)
+        (deep / "module.py").write_text("x = 1")
+        result = mgr.handle_request({
+            "type": "cherry_pick",
+            "source_agent": "alpha",
+            "target_agent": "beta",
+            "file": "src/deep/module.py",
+        })
+        assert result["status"] == "ok"
+        beta_rt = mgr.agents["beta"]
+        assert (beta_rt.worktree_path / "src" / "deep" / "module.py").read_text() == "x = 1"
+
+    def test_cherry_pick_rejects_path_traversal(self, git_repo, evo_config):
+        evo_config.agents["beta"] = AgentConfig(role="explorer", runtime="claude-code")
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        result = mgr.handle_request({
+            "type": "cherry_pick",
+            "source_agent": "alpha",
+            "target_agent": "beta",
+            "file": "../../etc/passwd",
+        })
+        assert "error" in result
+
+    def test_cherry_pick_unknown_agent(self, git_repo, evo_config):
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        result = mgr.handle_request({
+            "type": "cherry_pick",
+            "source_agent": "nonexistent",
+            "target_agent": "alpha",
+            "file": "foo.py",
+        })
+        assert "error" in result
+
+
+class TestInboxConsolidation:
+    def test_consolidate_creates_digest(self, tmp_path):
+        from evolution.adapters.base import AgentAdapter
+        adapter = AgentAdapter()
+        inbox = tmp_path / ".evolution" / "inbox"
+        inbox.mkdir(parents=True)
+        # Create 5 individual messages
+        for i in range(5):
+            (inbox / f"msg-{i}.md").write_text(f"[LEADERBOARD] update {i}")
+
+        result = adapter.consolidate_inbox(tmp_path)
+
+        assert result is not None
+        assert result.name.startswith("DIGEST-")
+        content = result.read_text()
+        assert "update 0" in content
+        assert "update 4" in content
+        # Individual messages removed
+        assert not (inbox / "msg-0.md").exists()
+
+    def test_consolidate_skips_single_message(self, tmp_path):
+        from evolution.adapters.base import AgentAdapter
+        adapter = AgentAdapter()
+        inbox = tmp_path / ".evolution" / "inbox"
+        inbox.mkdir(parents=True)
+        (inbox / "msg-0.md").write_text("only one")
+        result = adapter.consolidate_inbox(tmp_path)
+        assert result is None  # no consolidation needed
+        assert (inbox / "msg-0.md").exists()  # not removed
+
+
+# =========================================================================
+# Notes tag filtering tests
+# =========================================================================
+
+
+class TestNotesTagFilter:
+    def test_filter_by_tag(self, git_repo, evo_config):
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        mgr.handle_request({"type": "note", "agent": "alpha", "text": "BM25 helps", "tags": ["technique"]})
+        mgr.handle_request({"type": "note", "agent": "alpha", "text": "Neo4j slow", "tags": ["dead-end"]})
+        result = mgr.handle_request({"type": "notes_list", "tag": "technique"})
+        assert len(result["notes"]) == 1
+        assert "BM25" in result["notes"][0]["text"]
+
+    def test_filter_by_tag_and_agent(self, git_repo, evo_config):
+        evo_config.agents["beta"] = AgentConfig(role="explorer", runtime="claude-code")
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        mgr.handle_request({"type": "note", "agent": "alpha", "text": "technique A", "tags": ["technique"]})
+        mgr.handle_request({"type": "note", "agent": "beta", "text": "technique B", "tags": ["technique"]})
+        result = mgr.handle_request({"type": "notes_list", "agent": "alpha", "tag": "technique"})
+        assert len(result["notes"]) == 1
+        assert result["notes"][0]["text"] == "technique A"
+
+    def test_no_tag_returns_all(self, git_repo, evo_config):
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        mgr.handle_request({"type": "note", "agent": "alpha", "text": "a", "tags": ["x"]})
+        mgr.handle_request({"type": "note", "agent": "alpha", "text": "b", "tags": ["y"]})
+        result = mgr.handle_request({"type": "notes_list"})
+        assert len(result["notes"]) >= 2
+
+
+# =========================================================================
+# Hypothesis hub tests
+# =========================================================================
+
+
+class TestManagerHypotheses:
+    def test_add_and_list(self, git_repo, evo_config):
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        result = mgr.handle_request({"type": "hypothesis_add", "agent": "alpha", "hypothesis": "BM25 > 0.5 hurts TR", "metric": "tr_score"})
+        assert result["status"] == "ok"
+        assert result["id"] == "H-1"
+        listed = mgr.handle_request({"type": "hypothesis_list"})
+        assert len(listed["hypotheses"]) == 1
+
+    def test_resolve(self, git_repo, evo_config):
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        mgr.handle_request({"type": "hypothesis_add", "agent": "alpha", "hypothesis": "test", "metric": "s"})
+        result = mgr.handle_request({"type": "hypothesis_resolve", "id": "H-1", "agent": "alpha", "resolution": "validated", "evidence": "confirmed"})
+        assert result["status"] == "ok"
+        assert result["resolution"] == "validated"
+
+
+# =========================================================================
+# Phase tracking tests
+# =========================================================================
+
+
+class TestPhaseTracking:
+    def test_eval_blocked_during_research(self, git_repo, evo_config):
+        from evolution.manager.config import PhaseConfig
+        evo_config.task.phases = [
+            PhaseConfig(name="research", duration="1h", eval_blocked=True),
+            PhaseConfig(name="evolve"),
+        ]
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        result = mgr.handle_request({"type": "eval", "agent": "alpha", "description": "test"})
+        assert result["status"] == "rejected"
+        assert "Research phase" in result.get("reason", "") or "research" in result.get("reason", "").lower()
+
+    def test_eval_allowed_without_phases(self, git_repo, evo_config):
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        result = mgr.handle_request({"type": "eval", "agent": "alpha", "description": "test"})
+        assert result["status"] in ("ok", "queued")
+
+    def test_phase_transition(self, git_repo, evo_config):
+        from evolution.manager.config import PhaseConfig
+        evo_config.task.phases = [
+            PhaseConfig(name="research", duration="0s", eval_blocked=True),  # instant
+            PhaseConfig(name="evolve"),
+        ]
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        import time; time.sleep(0.1)
+        mgr.check_phase_transition()
+        # After transition, eval should work
+        result = mgr.handle_request({"type": "eval", "agent": "alpha", "description": "test"})
+        assert result["status"] in ("ok", "queued")
+
+
+# =========================================================================
+# Convergence tests
+# =========================================================================
+
+
+class TestConvergence:
+    def test_converge_resets_worktrees(self, git_repo, evo_config):
+        from evolution.manager.config import AgentConfig
+        evo_config.agents["beta"] = AgentConfig(role="explorer", runtime="claude-code")
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        # Simulate alpha scoring higher
+        mgr._best_score = 0.9
+        mgr._best_agent = "alpha"
+        # Modify alpha's worktree and commit
+        alpha_rt = mgr.agents["alpha"]
+        (alpha_rt.worktree_path / "solution.py").write_text("# alpha's best solution")
+        subprocess.run(["git", "add", "-A"], cwd=str(alpha_rt.worktree_path), capture_output=True)
+        subprocess.run(["git", "commit", "-m", "alpha work"], cwd=str(alpha_rt.worktree_path), capture_output=True)
+
+        mgr.do_converge()
+
+        # Beta should now have alpha's solution
+        beta_rt = mgr.agents["beta"]
+        assert (beta_rt.worktree_path / "solution.py").exists()
+        assert "alpha's best solution" in (beta_rt.worktree_path / "solution.py").read_text()
+
+    def test_converge_skips_when_no_evals(self, git_repo, evo_config):
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        # No best agent set
+        mgr.do_converge()  # should not raise
+
+    def test_converge_best_agent_unchanged(self, git_repo, evo_config):
+        from evolution.manager.config import AgentConfig
+        evo_config.agents["beta"] = AgentConfig(role="explorer", runtime="claude-code")
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        mgr._best_score = 0.9
+        mgr._best_agent = "alpha"
+        alpha_rt = mgr.agents["alpha"]
+        (alpha_rt.worktree_path / "marker.txt").write_text("alpha marker")
+        subprocess.run(["git", "add", "-A"], cwd=str(alpha_rt.worktree_path), capture_output=True)
+        subprocess.run(["git", "commit", "-m", "marker"], cwd=str(alpha_rt.worktree_path), capture_output=True)
+
+        mgr.do_converge()
+
+        # Alpha's worktree should be untouched
+        assert (alpha_rt.worktree_path / "marker.txt").read_text() == "alpha marker"
+
+
+# =========================================================================
+# Session archival tests
+# =========================================================================
+
+
+class TestSessionArchival:
+    def test_archive_creates_session_dir(self, git_repo, evo_config):
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        mgr.archive_session()
+        session_dir = git_repo / ".evolution" / "sessions" / "test-session"
+        assert session_dir.exists()
+        assert (session_dir / "state.json").exists()
+        assert (session_dir / "shared" / "attempts").is_dir()
+
+    def test_archive_includes_best_agent_branch(self, git_repo, evo_config):
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        mgr._best_agent = "alpha"
+        mgr._best_score = 0.95
+        mgr.save_state()
+        mgr.archive_session()
+        import json
+        state = json.loads((git_repo / ".evolution" / "sessions" / "test-session" / "state.json").read_text())
+        assert state.get("best_agent_branch") == "evolution/alpha"
+
+
+# =========================================================================
+# Session chaining tests
+# =========================================================================
+
+
+class TestSessionChaining:
+    def test_seed_from_loads_memory(self, git_repo, evo_config):
+        # First session: create and archive
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        # Add a memory file
+        memory_dir = git_repo / ".evolution" / "shared" / "memory"
+        memory_dir.mkdir(parents=True, exist_ok=True)
+        (memory_dir / "insight.yaml").write_text("key insight from session 1")
+        mgr._best_agent = "alpha"
+        mgr._best_score = 0.9
+        mgr.archive_session()
+
+        # Second session with seed_from
+        evo_config.session.seed_from = "test-session"
+        mgr2 = Manager(evo_config, git_repo)
+        mgr2.load_seed_from()
+
+        # Memory should be carried over
+        new_memory = git_repo / ".evolution" / "shared" / "memory" / "insight.yaml"
+        assert new_memory.exists()
+        assert "key insight" in new_memory.read_text()
+
+
+# =========================================================================
+# Merge tests
+# =========================================================================
+
+
+class TestManagerMerge:
+    def test_merge_creates_branch(self, git_repo, evo_config):
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        # Make a change and record a score
+        rt = mgr.agents["alpha"]
+        (rt.worktree_path / "solution.py").write_text("# best solution")
+        mgr.grade_and_record("alpha", "added solution")
+        # Now merge
+        result = mgr.handle_request({
+            "type": "merge",
+            "branch": "evolution/test-merge",
+        })
+        assert result["status"] == "ok"
+        assert result["agent"] == "alpha"
+        assert result["branch"] == "evolution/test-merge"
+        assert result["files_changed"] >= 1
+        assert "changelog" in result
+        # Verify branch exists
+        br = subprocess.run(
+            ["git", "branch", "--list", "evolution/test-merge"],
+            cwd=git_repo, capture_output=True, text=True,
+        )
+        assert "evolution/test-merge" in br.stdout
+
+    def test_merge_dry_run(self, git_repo, evo_config):
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        rt = mgr.agents["alpha"]
+        (rt.worktree_path / "solution.py").write_text("# best solution")
+        mgr.grade_and_record("alpha", "added solution")
+        result = mgr.handle_request({
+            "type": "merge",
+            "dry_run": True,
+        })
+        assert result["status"] == "ok"
+        assert result["dry_run"] is True
+        assert "changelog" in result
+        # Branch should NOT be created
+        br = subprocess.run(
+            ["git", "branch", "--list", "evolution/merge"],
+            cwd=git_repo, capture_output=True, text=True,
+        )
+        assert "evolution/merge" not in br.stdout
+
+    def test_merge_no_evals(self, git_repo, evo_config):
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        result = mgr.handle_request({"type": "merge"})
+        assert "error" in result
+
+    def test_merge_changelog_includes_attempts(self, git_repo, evo_config):
+        mgr = Manager(evo_config, git_repo)
+        mgr.setup()
+        rt = mgr.agents["alpha"]
+        (rt.worktree_path / "solution.py").write_text("# v1")
+        mgr.grade_and_record("alpha", "first attempt")
+        result = mgr.handle_request({"type": "merge", "dry_run": True})
+        assert "first attempt" in result["changelog"]
+        assert "Top Attempts" in result["changelog"]

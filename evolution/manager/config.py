@@ -3,14 +3,38 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field
 
 
+class NamedHeartbeatConfig(BaseModel):
+    """A single named heartbeat action."""
+
+    name: str
+    every: int  # fire every N attempts
+
+
 class HeartbeatConfig(BaseModel):
-    """Configuration for agent heartbeat monitoring."""
+    """Configuration for agent heartbeat monitoring.
+
+    Supports two formats:
+
+    Legacy (single heartbeat)::
+
+        heartbeat:
+          on_attempts: 3
+          on_time: 10m
+
+    Named list (multiple heartbeats at different frequencies)::
+
+        heartbeat:
+          - name: reflect
+            every: 1
+          - name: consolidate
+            every: 10
+    """
 
     on_attempts: int = 3
     on_time: str = "10m"
@@ -30,10 +54,28 @@ class RestartConfig(BaseModel):
 
 
 class RoleConfig(BaseModel):
-    """A named role that agents can assume."""
+    """A named role that agents can assume.
+
+    ``heartbeat`` accepts either the legacy dict format or a list of named
+    heartbeat actions::
+
+        # Legacy
+        heartbeat:
+          on_attempts: 3
+          on_time: 10m
+
+        # Named list
+        heartbeat:
+          - name: reflect
+            every: 1
+          - name: consolidate
+            every: 10
+    """
 
     prompt: str
-    heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
+    heartbeat: HeartbeatConfig | list[NamedHeartbeatConfig] = Field(
+        default_factory=HeartbeatConfig
+    )
 
 
 class AgentConfig(BaseModel):
@@ -53,6 +95,7 @@ class SessionConfig(BaseModel):
 
     name: str
     log_level: str = "info"
+    seed_from: str | None = None
 
 
 class MilestoneConfig(BaseModel):
@@ -75,6 +118,25 @@ class StopConfig(BaseModel):
     milestone_stop: str | None = None
 
 
+class EvalQueueConfig(BaseModel):
+    """Configuration for the eval submission queue."""
+
+    concurrency: int = 1
+    fairness: str = "round_robin"
+    max_queued: int = 8
+    rate_limit_seconds: int = 0
+    priority_boost: str = "none"
+
+
+class PhaseConfig(BaseModel):
+    """Configuration for a session phase (e.g., research, evolve)."""
+
+    name: str
+    duration: str | None = None
+    eval_blocked: bool = False
+    prompt: str | None = None
+
+
 class TaskConfig(BaseModel):
     """Configuration describing the task to be evolved."""
 
@@ -88,6 +150,9 @@ class TaskConfig(BaseModel):
     ranking: dict[str, Any] | None = None
     milestones: MilestoneConfig = Field(default_factory=MilestoneConfig)
     stop: StopConfig = Field(default_factory=StopConfig)
+    eval_queue: EvalQueueConfig | None = None
+    phases: list[PhaseConfig] | None = None
+    workspace_strategy: Literal["auto", "reflink", "git_worktree"] = "auto"
 
 
 class SuperagentConfig(BaseModel):

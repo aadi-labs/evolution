@@ -93,8 +93,32 @@ class AgentAdapter:
         inbox = worktree_path / ".evolution" / "inbox"
         inbox.mkdir(parents=True, exist_ok=True)
 
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S-%f")
         filename = f"{timestamp}-{agent_name}.md"
         msg_path = inbox / filename
         msg_path.write_text(message)
         return msg_path
+
+    def consolidate_inbox(self, worktree_path: Path) -> Path | None:
+        """Consolidate all inbox messages into a single digest file.
+
+        Returns the digest path, or None if consolidation wasn't needed.
+        """
+        inbox = worktree_path / ".evolution" / "inbox"
+        if not inbox.exists():
+            return None
+
+        messages = sorted(inbox.glob("*.md"))
+        if len(messages) <= 1:
+            return None
+
+        # Build digest from all messages
+        lines = []
+        for msg_path in messages:
+            lines.append(msg_path.read_text().strip())
+            msg_path.unlink()
+
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        digest_path = inbox / f"DIGEST-{timestamp}.md"
+        digest_path.write_text("\n\n---\n\n".join(lines))
+        return digest_path

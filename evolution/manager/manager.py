@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -15,6 +16,7 @@ from evolution.adapters.codex import CodexAdapter
 from evolution.adapters.opencode import OpenCodeAdapter
 from evolution.grader.script import ScriptGrader
 from evolution.hub.attempts import AttemptsHub
+from evolution.hub.hypotheses import HypothesisHub
 from evolution.hub.notes import NotesHub
 from evolution.hub.skills import SkillsHub
 from evolution.manager.config import EvolutionConfig
@@ -41,7 +43,8 @@ class Manager:
         self.repo_root = Path(repo_root)
 
         # Workspace manager
-        self.workspace = WorkspaceManager(self.repo_root)
+        strategy = getattr(config.task, "workspace_strategy", "auto")
+        self.workspace = WorkspaceManager(self.repo_root, strategy=strategy)
 
         # Shared directory
         self.shared_dir = self.workspace.create_shared_dir()
@@ -50,6 +53,7 @@ class Manager:
         self.attempts_hub = AttemptsHub(self.shared_dir / "attempts")
         self.notes_hub = NotesHub(self.shared_dir / "notes")
         self.skills_hub = SkillsHub(self.shared_dir / "skills")
+        self.hypotheses_hub = HypothesisHub(self.shared_dir / "hypotheses")
 
         # Socket server
         self.evolution_dir = self.repo_root / ".evolution"
@@ -86,12 +90,34 @@ class Manager:
         if config.task.metric:
             self._direction = config.task.metric.get("direction", "lower_is_better")
 
+        # Eval queue (optional — when configured, evals are queued not immediate)
+        self._eval_queue = None
+        if config.task.eval_queue:
+            from evolution.manager.eval_queue import EvalQueue
+            eq = config.task.eval_queue
+            self._eval_queue = EvalQueue(
+                max_queued=eq.max_queued,
+                fairness=eq.fairness,
+                rate_limit_seconds=eq.rate_limit_seconds,
+            )
+
+        # Phase tracking
+        self._phases = config.task.phases or []
+        self._current_phase_index = 0
+        self._phase_start = time.monotonic()
+        # Validate durations eagerly
+        for phase in self._phases:
+            if phase.duration:
+                parse_duration(phase.duration)  # raises ValueError on invalid
+
     # ------------------------------------------------------------------
     # Setup
     # ------------------------------------------------------------------
 
     def setup(self) -> None:
         """Provision all agents: create worktrees, copy seed, configure adapters."""
+        self.load_seed_from()
+
         seed_path = Path(self.config.task.seed)
         if not seed_path.is_absolute():
             seed_path = self.repo_root / seed_path
@@ -125,6 +151,38 @@ class Manager:
             runtime = AgentRuntime(agent_name, agent_cfg, role_cfg)
             runtime.worktree_path = wt_path
             self.agents[agent_name] = runtime
+
+    def load_seed_from(self) -> None:
+        """Load best code and memory from a previous session."""
+        seed_from = self.config.session.seed_from
+        if not seed_from:
+            return
+
+        session_dir = self.evolution_dir / "sessions" / seed_from
+        if not session_dir.exists():
+            logger.warning("seed_from session '%s' not found at %s", seed_from, session_dir)
+            return
+
+        # Copy memory from previous session
+        prev_memory = session_dir / "shared" / "memory"
+        new_memory = self.shared_dir / "memory"
+        if prev_memory.exists():
+            import shutil
+            new_memory.mkdir(parents=True, exist_ok=True)
+            for f in prev_memory.iterdir():
+                shutil.copy2(f, new_memory / f.name)
+            logger.info("Loaded %d memory files from session '%s'", len(list(prev_memory.iterdir())), seed_from)
+
+        # Read best agent branch for potential code checkout
+        state_path = session_dir / "state.json"
+        if state_path.exists():
+            state = json.loads(state_path.read_text())
+            best_branch = state.get("best_agent_branch")
+            if best_branch:
+                logger.info("Previous best: %s (branch: %s)", state.get("best_agent"), best_branch)
+                # The branch still exists from the previous session's worktree
+                # New worktrees will be created from HEAD; if user wants to use
+                # the best branch, they should merge it to main before starting
 
     # ------------------------------------------------------------------
     # Request handling
@@ -160,8 +218,22 @@ class Manager:
                 return self._handle_kill(request)
             elif req_type == "spawn":
                 return self._handle_spawn(request)
+            elif req_type == "claims":
+                return self._handle_claims(request)
+            elif req_type == "diff":
+                return self._handle_diff(request)
+            elif req_type == "cherry_pick":
+                return self._handle_cherry_pick(request)
+            elif req_type == "hypothesis_add":
+                return self._handle_hypothesis_add(request)
+            elif req_type == "hypothesis_list":
+                return self._handle_hypothesis_list(request)
+            elif req_type == "hypothesis_resolve":
+                return self._handle_hypothesis_resolve(request)
             elif req_type == "stop":
                 return self._handle_stop(request)
+            elif req_type == "merge":
+                return self._handle_merge(request)
             else:
                 return {"error": f"Unknown request type: {req_type}"}
         except Exception as exc:
@@ -169,10 +241,44 @@ class Manager:
             return {"error": str(exc)}
 
     # ------------------------------------------------------------------
+    # Phase tracking
+    # ------------------------------------------------------------------
+
+    def is_eval_blocked(self) -> bool:
+        """Check if current phase blocks eval submissions."""
+        if not self._phases or self._current_phase_index >= len(self._phases):
+            return False
+        return self._phases[self._current_phase_index].eval_blocked
+
+    def check_phase_transition(self) -> None:
+        """Advance to next phase if current phase duration expired."""
+        if not self._phases or self._current_phase_index >= len(self._phases):
+            return
+        phase = self._phases[self._current_phase_index]
+        if phase.duration is None:
+            return
+        elapsed = time.monotonic() - self._phase_start
+        if elapsed >= parse_duration(phase.duration):
+            self._current_phase_index += 1
+            self._phase_start = time.monotonic()
+            next_name = (
+                self._phases[self._current_phase_index].name
+                if self._current_phase_index < len(self._phases)
+                else "default"
+            )
+            self._broadcast_message(
+                "manager",
+                f"[PHASE] Phase '{phase.name}' complete. Entering '{next_name}' phase.",
+            )
+
+    # ------------------------------------------------------------------
     # Handlers
     # ------------------------------------------------------------------
 
     def _handle_eval(self, request: dict) -> dict:
+        if self.is_eval_blocked():
+            return {"status": "rejected", "reason": "Research phase active. Share findings with: evolution note add"}
+
         agent_name = request.get("agent", "")
         description = request.get("description", "")
 
@@ -187,7 +293,28 @@ class Manager:
         if wt_path is None:
             return {"error": f"Agent {agent_name} has no worktree"}
 
-        # No git operations — just record the eval
+        # When an eval queue is configured, submit and return immediately
+        if self._eval_queue is not None:
+            return self._eval_queue.submit(agent_name, description)
+
+        # Otherwise, grade synchronously (preserves existing behaviour)
+        return self.grade_and_record(agent_name, description)
+
+    def grade_and_record(self, agent_name: str, description: str) -> dict:
+        """Run the grader, record the attempt, track heartbeat, and check improvement.
+
+        This method is called either synchronously from ``_handle_eval`` or
+        asynchronously by the eval-worker thread when an ``EvalQueue`` is active.
+        """
+        runtime = self.agents.get(agent_name)
+        if runtime is None:
+            return {"error": f"Unknown agent: {agent_name}"}
+
+        wt_path = runtime.worktree_path
+        if wt_path is None:
+            return {"error": f"Agent {agent_name} has no worktree"}
+
+        # Synthetic commit hash (no git operations)
         commit_hash = f"eval-{agent_name}-{len(self.attempts_hub.list()) + 1}"
 
         # Run grader
@@ -211,13 +338,21 @@ class Manager:
         )
 
         # Track heartbeat
-        runtime.heartbeat.record_attempt()
+        if runtime.multi_heartbeat is not None:
+            runtime.multi_heartbeat.record_attempt()
+        elif runtime.heartbeat is not None:
+            runtime.heartbeat.record_attempt()
 
         # Check improvement
         if score is not None:
             self._check_improvement(score, agent_name, self._direction)
 
-        return {
+        # Broadcast leaderboard update
+        board = self.attempts_hub.leaderboard(self._direction)
+        top3 = ", ".join(f"{a.agent}={a.score}" for a in board[:3])
+        self._broadcast_message("manager", f"[LEADERBOARD] {agent_name} scored {score}. Top 3: {top3}")
+
+        result = {
             "status": "ok",
             "attempt_id": attempt.id,
             "score": score,
@@ -225,12 +360,29 @@ class Manager:
             "improvement": attempt.improvement,
         }
 
+        # Deliver result to agent's inbox when running asynchronously
+        if self._eval_queue is not None and runtime.worktree_path:
+            adapter = self._get_adapter(runtime)
+            if adapter:
+                msg = (
+                    f"Eval complete — score: {score}, feedback: {feedback}, "
+                    f"improvement: {attempt.improvement}"
+                )
+                adapter.deliver_message(runtime.worktree_path, "manager", msg)
+
+        return result
+
     def _handle_note(self, request: dict) -> dict:
         agent = request.get("agent", "")
         text = request.get("text", "")
         tags = request.get("tags", [])
 
         note = self.notes_hub.add(agent=agent, text=text, tags=tags)
+
+        # Broadcast work claims
+        if "WORKING ON" in text or "working-on" in tags:
+            self._broadcast_message("manager", f"[CLAIM] {agent} is {text[:200]}")
+
         return {"status": "ok", "agent": note.agent, "timestamp": note.timestamp}
 
     def _handle_skill(self, request: dict) -> dict:
@@ -298,9 +450,13 @@ class Manager:
 
     def _handle_notes_list(self, request: dict) -> dict:
         agent = request.get("agent")
+        tag_filter = request.get("tag")
         notes = self.notes_hub.list(agent=agent)
         entries = []
         for n in notes:
+            # Tag filter (AND with agent filter)
+            if tag_filter and tag_filter not in n.tags:
+                continue
             entries.append({
                 "agent": n.agent,
                 "text": n.text,
@@ -320,6 +476,29 @@ class Manager:
                 "timestamp": s.timestamp,
             })
         return {"status": "ok", "skills": entries}
+
+    def _handle_hypothesis_add(self, request: dict) -> dict:
+        agent = request.get("agent", "")
+        hypothesis = request.get("hypothesis", "")
+        metric = request.get("metric", "")
+        h = self.hypotheses_hub.add(agent=agent, hypothesis=hypothesis, metric=metric)
+        return {"status": "ok", "id": h.id, "hypothesis": h.hypothesis}
+
+    def _handle_hypothesis_list(self, request: dict) -> dict:
+        status_filter = request.get("status")
+        hypotheses = self.hypotheses_hub.list(status=status_filter)
+        entries = [{"id": h.id, "agent": h.agent, "hypothesis": h.hypothesis, "metric": h.metric, "status": h.status} for h in hypotheses]
+        return {"status": "ok", "hypotheses": entries}
+
+    def _handle_hypothesis_resolve(self, request: dict) -> dict:
+        h_id = request.get("id", "")
+        status = request.get("resolution", "")
+        resolved_by = request.get("agent", "")
+        evidence = request.get("evidence", "")
+        h = self.hypotheses_hub.resolve(h_id, status=status, resolved_by=resolved_by, evidence=evidence)
+        if h is None:
+            return {"error": f"Hypothesis {h_id} not found"}
+        return {"status": "ok", "id": h.id, "resolution": h.status}
 
     def _handle_msg(self, request: dict) -> dict:
         sender = request.get("from", "manager")
@@ -472,9 +651,242 @@ class Manager:
 
         return {"status": "ok", "spawned": new_name}
 
+    def _handle_claims(self, request: dict) -> dict:
+        """Return active work claims across all agents."""
+        notes = self.notes_hub.list()
+        active: dict[str, dict] = {}
+        for note in notes:
+            if "WORKING ON" in note.text or "working-on" in note.tags:
+                active[note.agent] = {"agent": note.agent, "text": note.text, "timestamp": note.timestamp}
+            elif ("DONE" in note.text or "done" in note.tags) and note.agent in active:
+                del active[note.agent]
+        return {"status": "ok", "claims": list(active.values())}
+
+    def _handle_diff(self, request: dict) -> dict:
+        """Return diff for a specific agent's worktree."""
+        agent_name = request.get("agent", "")
+        rt = self.agents.get(agent_name)
+        if rt is None:
+            return {"error": f"Unknown agent: {agent_name}"}
+        if rt.worktree_path is None:
+            return {"error": f"Agent {agent_name} has no worktree"}
+
+        # Try git diff first (works for git worktree strategy)
+        result = subprocess.run(
+            ["git", "diff", "HEAD"],
+            cwd=str(rt.worktree_path),
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0 and (rt.worktree_path / ".git").exists():
+            return {"status": "ok", "diff": result.stdout, "agent": agent_name}
+
+        # Fallback: diff against original repo (for reflink worktrees without .git)
+        result = subprocess.run(
+            ["diff", "-ru", "--exclude=.evolution", "--exclude=.git",
+             str(self.repo_root), str(rt.worktree_path)],
+            capture_output=True,
+            text=True,
+        )
+        # diff returns 1 when files differ (not an error), 2 on trouble
+        return {"status": "ok", "diff": result.stdout, "agent": agent_name}
+
+    def _handle_cherry_pick(self, request: dict) -> dict:
+        """Copy a file from one agent's worktree to another."""
+        import shutil
+
+        source_name = request.get("source_agent", "")
+        target_name = request.get("target_agent", "")
+        file_path = request.get("file", "")
+
+        source = self.agents.get(source_name)
+        target = self.agents.get(target_name)
+
+        if not source or not source.worktree_path:
+            return {"error": f"Unknown source agent: {source_name}"}
+        if not target or not target.worktree_path:
+            return {"error": f"Unknown target agent: {target_name}"}
+        if not file_path:
+            return {"error": "Missing file path"}
+
+        # Path traversal safety
+        src = (source.worktree_path / file_path).resolve()
+        if not str(src).startswith(str(source.worktree_path.resolve())):
+            return {"error": "Path traversal rejected — file must be within worktree"}
+        if not src.exists():
+            return {"error": f"File not found: {file_path}"}
+
+        dst = target.worktree_path / file_path
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+
+        return {"status": "ok", "file": file_path, "from": source_name, "to": target_name}
+
     def _handle_stop(self, request: dict) -> dict:
         self._running = False
         return {"status": "ok", "stopped": True}
+
+    def _handle_merge(self, request: dict) -> dict:
+        """Create a branch with the best agent's changes and a changelog commit."""
+        agent_name = request.get("agent") or self._best_agent
+        branch_name = request.get("branch", "evolution/merge")
+        dry_run = request.get("dry_run", False)
+
+        if agent_name is None:
+            return {"error": "No best agent — no evals submitted yet"}
+
+        rt = self.agents.get(agent_name)
+        if rt is None:
+            return {"error": f"Unknown agent: {agent_name}"}
+        if rt.worktree_path is None:
+            return {"error": f"Agent {agent_name} has no worktree"}
+
+        # Build changelog from attempts and notes
+        changelog = self._build_changelog(agent_name)
+
+        if dry_run:
+            return {
+                "status": "ok",
+                "dry_run": True,
+                "agent": agent_name,
+                "score": self._best_score,
+                "branch": branch_name,
+                "changelog": changelog,
+            }
+
+        # Create a new branch from HEAD in the main repo
+        result = subprocess.run(
+            ["git", "branch", "-D", branch_name],
+            cwd=str(self.repo_root),
+            capture_output=True,
+        )  # delete if exists (ignore errors)
+
+        result = subprocess.run(
+            ["git", "checkout", "-b", branch_name],
+            cwd=str(self.repo_root),
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return {"error": f"Failed to create branch: {result.stderr.strip()}"}
+
+        # Copy changed files from agent worktree to main repo
+        changed_files = self._get_changed_files(rt.worktree_path)
+        import shutil
+        for rel_path in changed_files:
+            src = rt.worktree_path / rel_path
+            dst = self.repo_root / rel_path
+            if src.exists() and src.is_file():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+            elif dst.exists() and dst.is_file():
+                dst.unlink()  # file was deleted by agent
+
+        # Stage all changes
+        subprocess.run(
+            ["git", "add", "-A"],
+            cwd=str(self.repo_root),
+            capture_output=True,
+        )
+
+        # Commit with changelog
+        commit_msg = (
+            f"evolution: merge {agent_name} (score {self._best_score})\n\n"
+            f"{changelog}"
+        )
+        result = subprocess.run(
+            ["git", "commit", "-m", commit_msg, "--no-gpg-sign"],
+            cwd=str(self.repo_root),
+            capture_output=True,
+            text=True,
+        )
+
+        # Switch back to previous branch
+        subprocess.run(
+            ["git", "checkout", "-"],
+            cwd=str(self.repo_root),
+            capture_output=True,
+        )
+
+        return {
+            "status": "ok",
+            "agent": agent_name,
+            "score": self._best_score,
+            "branch": branch_name,
+            "files_changed": len(changed_files),
+            "changelog": changelog,
+        }
+
+    def _get_changed_files(self, worktree_path: Path) -> list[str]:
+        """Get list of files that differ between worktree and repo root."""
+        changed: list[str] = []
+
+        # Try git diff if worktree has .git
+        if (worktree_path / ".git").exists():
+            result = subprocess.run(
+                ["git", "diff", "HEAD", "--name-only"],
+                cwd=str(worktree_path),
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip().splitlines()
+
+        # Fallback: walk worktree and compare files against repo root
+        import filecmp
+        skip = {".evolution", ".git", ".venv", "node_modules", "__pycache__", ".DS_Store", ".claude"}
+        for root, dirs, files in os.walk(worktree_path):
+            dirs[:] = [d for d in dirs if d not in skip]
+            for f in files:
+                wt_file = Path(root) / f
+                rel = str(wt_file.relative_to(worktree_path))
+                repo_file = self.repo_root / rel
+                if not repo_file.exists():
+                    changed.append(rel)  # new file
+                elif not filecmp.cmp(str(wt_file), str(repo_file), shallow=False):
+                    changed.append(rel)  # modified file
+
+        return changed
+
+    def _build_changelog(self, agent_name: str) -> str:
+        """Build a changelog from the session's attempts and notes."""
+        lines = []
+        lines.append(f"## Evolution Session: {self.config.session.name}")
+        lines.append(f"**Best agent:** {agent_name}")
+        lines.append(f"**Best score:** {self._best_score}")
+        lines.append("")
+
+        # Top attempts
+        board = self.attempts_hub.leaderboard(self._direction)
+        if board:
+            lines.append("### Top Attempts")
+            for a in board[:10]:
+                marker = " *" if a.agent == agent_name else ""
+                lines.append(f"- #{a.id} {a.agent}: {a.score} — {a.description[:80]}{marker}")
+            lines.append("")
+
+        # Key findings from notes
+        notes = self.notes_hub.list()
+        findings = [n for n in notes if any(
+            tag in n.tags for tag in ("technique", "finding", "dead-end")
+        ) or any(prefix in n.text for prefix in ("FINDING:", "DEAD END:", "DONE:"))]
+        if findings:
+            lines.append("### Key Findings")
+            for n in findings[:20]:
+                lines.append(f"- [{n.agent}] {n.text[:120]}")
+            lines.append("")
+
+        # Hypotheses
+        if hasattr(self, 'hypotheses_hub'):
+            hypotheses = self.hypotheses_hub.list()
+            if hypotheses:
+                lines.append("### Hypotheses")
+                for h in hypotheses:
+                    status_icon = {"validated": "✓", "invalidated": "✗", "open": "?"}.get(h.status, "?")
+                    lines.append(f"- [{status_icon}] {h.hypothesis}")
+                lines.append("")
+
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Improvement & milestones
@@ -519,7 +931,7 @@ class Manager:
 
             if reached:
                 message = (
-                    f"Milestone '{name}' reached! Score {score} by agent {agent_name} "
+                    f"[MILESTONE] '{name}' reached! Score {score} by agent {agent_name} "
                     f"(threshold: {threshold})"
                 )
                 self._broadcast_message("manager", message)
@@ -581,6 +993,55 @@ class Manager:
         return None
 
     # ------------------------------------------------------------------
+    # Convergence
+    # ------------------------------------------------------------------
+
+    def do_converge(self) -> None:
+        """Reset all agent worktrees to the best-scoring agent's code."""
+        if self._best_agent is None:
+            logger.info("Convergence skipped — no evals yet")
+            return
+
+        best_rt = self.agents.get(self._best_agent)
+        if best_rt is None or best_rt.worktree_path is None:
+            logger.warning("Convergence skipped — best agent %s not found", self._best_agent)
+            return
+
+        best_branch = f"evolution/{self._best_agent}"
+
+        for name, rt in self.agents.items():
+            if name == self._best_agent or rt.worktree_path is None:
+                continue
+
+            try:
+                wt = str(rt.worktree_path)
+                # Snapshot current state
+                subprocess.run(["git", "add", "-A"], cwd=wt, capture_output=True)
+                subprocess.run(
+                    ["git", "commit", "-m", "pre-convergence snapshot"],
+                    cwd=wt, capture_output=True,
+                )
+                # Checkout best agent's files
+                subprocess.run(
+                    ["git", "checkout", best_branch, "--", "."],
+                    cwd=wt, capture_output=True, check=True,
+                )
+                subprocess.run(
+                    ["git", "commit", "-m", f"converge to {self._best_agent} (score {self._best_score})"],
+                    cwd=wt, capture_output=True,
+                )
+                logger.info("Converged %s to %s", name, self._best_agent)
+            except Exception as exc:
+                logger.error("Convergence failed for %s: %s", name, exc)
+
+        # Broadcast
+        self._broadcast_message(
+            "manager",
+            f"[CONVERGE] Rebased all worktrees to {self._best_agent}'s code (score {self._best_score}). "
+            f"Your previous changes are in git history (git diff HEAD~1). Build from this baseline.",
+        )
+
+    # ------------------------------------------------------------------
     # State persistence
     # ------------------------------------------------------------------
 
@@ -604,6 +1065,40 @@ class Manager:
 
         state_path = self.evolution_dir / "state.json"
         state_path.write_text(json.dumps(state, indent=2) + "\n")
+
+    # ------------------------------------------------------------------
+    # Session archival
+    # ------------------------------------------------------------------
+
+    def archive_session(self) -> None:
+        """Archive current session's shared state and state.json for session chaining."""
+        import shutil
+        session_name = self.config.session.name
+        sessions_dir = self.evolution_dir / "sessions" / session_name
+
+        try:
+            sessions_dir.mkdir(parents=True, exist_ok=True)
+
+            # Copy shared directory
+            shared_src = self.evolution_dir / "shared"
+            shared_dst = sessions_dir / "shared"
+            if shared_src.exists():
+                if shared_dst.exists():
+                    shutil.rmtree(shared_dst)
+                shutil.copytree(shared_src, shared_dst)
+
+            # Save state with best_agent_branch
+            self.save_state()
+            state_src = self.evolution_dir / "state.json"
+            if state_src.exists():
+                state_data = json.loads(state_src.read_text())
+                if self._best_agent:
+                    state_data["best_agent_branch"] = f"evolution/{self._best_agent}"
+                (sessions_dir / "state.json").write_text(json.dumps(state_data, indent=2) + "\n")
+
+            logger.info("Archived session '%s' to %s", session_name, sessions_dir)
+        except Exception as exc:
+            logger.warning("Session archival failed (best-effort): %s", exc)
 
     # ------------------------------------------------------------------
     # Helpers

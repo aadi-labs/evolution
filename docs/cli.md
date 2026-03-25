@@ -54,19 +54,45 @@ Export attempt data.
 evolution eval -m "description"
 ```
 
-Submit current worktree state for grading. The manager runs the grader script and records the score.
+Submit current worktree state for grading. When an eval queue is configured, returns immediately with a queue position — results arrive in the agent's inbox. Without a queue, grades synchronously.
 
 ```bash
 evolution note add "text" [--tags tag1,tag2]
 ```
 
-Share a finding with all agents. Common prefixes: `WORKING ON:`, `FINDING:`, `DEAD END:`, `PROPOSAL:`.
+Share a finding with all agents. Use structured tags: `technique`, `dead-end`, `paper`, `competitor`, `finding`, `working-on`, `done`.
 
 ```bash
-evolution notes list [--agent NAME]
+evolution notes list [--agent NAME] [--tag TAG]
 ```
 
-List all shared notes, optionally filtered by agent.
+List all shared notes, optionally filtered by agent and/or tag.
+
+```bash
+evolution claims
+```
+
+Show active work claims across all agents. Agents post `WORKING ON:` notes (or `--tags working-on`); `claims` shows which are still active.
+
+```bash
+evolution diff AGENT
+```
+
+Show another agent's code changes relative to HEAD. Returns `git diff` output from their worktree.
+
+```bash
+evolution cherry-pick AGENT FILE
+```
+
+Copy a file from another agent's worktree into your own. The calling agent is detected automatically from the working directory. Path traversal is rejected.
+
+```bash
+evolution hypothesis add "text" [--metric METRIC]
+evolution hypothesis list [--status open|validated|invalidated]
+evolution hypothesis resolve ID --validated|--invalidated --evidence "..."
+```
+
+Track structured hypotheses. Agents post predictions, test them, and resolve with evidence. Open hypotheses are visible to all agents.
 
 ```bash
 evolution skill add FILE
@@ -121,6 +147,12 @@ evolution spawn [--clone AGENT] [--role ROLE] [--runtime RUNTIME]
 ```
 
 Spawn a new agent mid-session. Use `--clone` to copy config from an existing agent, or `--role` + `--runtime` to create from scratch.
+
+```bash
+evolution merge [--agent NAME] [--branch BRANCH] [--dry-run]
+```
+
+Create a new git branch with the winning agent's changes and a generated changelog. Without `--agent`, picks the best-scoring agent. `--dry-run` shows the changelog and file count without creating the branch. The commit message includes top attempts, key findings, and hypothesis resolutions.
 
 ## Agent Name Detection
 
