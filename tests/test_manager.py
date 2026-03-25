@@ -1161,3 +1161,41 @@ class TestManagerMerge:
         result = mgr.handle_request({"type": "merge", "dry_run": True})
         assert "first attempt" in result["changelog"]
         assert "Top Attempts" in result["changelog"]
+
+
+class TestGraderTimeoutFromConfig:
+    def test_manager_passes_configured_timeout_to_grader(self, git_repo, tmp_path):
+        """Manager should read grader.timeout from config and pass it to grade()."""
+        script = tmp_path / "grade.py"
+        script.write_text("import sys\nprint('0.5')\nprint('ok', file=sys.stderr)\n")
+
+        config = EvolutionConfig(
+            session=SessionConfig(name="test"),
+            task=TaskConfig(
+                name="t", description="d", path=str(git_repo), seed=".",
+                grader={"script": str(script), "timeout": 42},
+            ),
+            roles={"r": RoleConfig(prompt="p")},
+            agents={"a": AgentConfig(role="r", runtime="claude-code")},
+        )
+
+        manager = Manager(config, git_repo)
+        assert manager._grader_timeout == 42
+
+    def test_manager_grader_timeout_defaults_to_1800(self, git_repo, tmp_path):
+        """When no timeout is specified, default to 1800."""
+        script = tmp_path / "grade.py"
+        script.write_text("print('0.5')\n")
+
+        config = EvolutionConfig(
+            session=SessionConfig(name="test"),
+            task=TaskConfig(
+                name="t", description="d", path=str(git_repo), seed=".",
+                grader={"script": str(script)},
+            ),
+            roles={"r": RoleConfig(prompt="p")},
+            agents={"a": AgentConfig(role="r", runtime="claude-code")},
+        )
+
+        manager = Manager(config, git_repo)
+        assert manager._grader_timeout == 1800

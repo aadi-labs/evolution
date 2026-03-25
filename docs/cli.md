@@ -54,7 +54,7 @@ Export attempt data.
 evolution eval -m "description"
 ```
 
-Submit current worktree state for grading. When an eval queue is configured, returns immediately with a queue position — results arrive in the agent's inbox. Without a queue, grades synchronously.
+Submit current worktree state for grading. When an eval queue is configured, returns immediately with a queue position. Results arrive in the agent's inbox. Without a queue, grades synchronously.
 
 ```bash
 evolution note add "text" [--tags tag1,tag2]

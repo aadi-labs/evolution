@@ -87,6 +87,7 @@ class AgentConfig(BaseModel):
     plugins: list[str] = Field(default_factory=list)
     mcp_servers: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
+    runtime_options: dict[str, Any] = Field(default_factory=dict)
     restart: RestartConfig = Field(default_factory=RestartConfig)
 
 

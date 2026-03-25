@@ -6,7 +6,6 @@ import logging
 import signal
 import sys
 import threading
-import time
 from pathlib import Path
 
 from evolution.manager.config import load_config
@@ -96,66 +95,8 @@ def cmd_run(args) -> None:
                 print(f"Stopping: {reason}")
                 break
 
-            # Check agent health — restart only if explicitly enabled
-            for name, runtime in list(manager.agents.items()):
-                if runtime.is_dead():
-                    restart_cfg = runtime.agent_config.restart
-                    if restart_cfg.enabled and runtime.restart_count < restart_cfg.max_restarts:
-                        adapter_cls = ADAPTERS.get(runtime.agent_config.runtime)
-                        if adapter_cls and runtime.worktree_path:
-                            adapter = adapter_cls()
-                            try:
-                                process = adapter.spawn(
-                                    runtime.worktree_path, runtime.agent_config
-                                )
-                                runtime.process = process
-                                runtime.restart_count += 1
-                                logger.info(
-                                    "Restarted agent %s (attempt %d/%d)",
-                                    name,
-                                    runtime.restart_count,
-                                    restart_cfg.max_restarts,
-                                )
-                            except Exception as exc:
-                                logger.error("Failed to restart agent %s: %s", name, exc)
-
-                # Check heartbeats — named list or legacy single
-                if runtime.multi_heartbeat is not None:
-                    pending = runtime.multi_heartbeat.get_pending()
-                    for hb_name in pending:
-                        logger.info(
-                            "Heartbeat '%s' fired for agent %s", hb_name, name
-                        )
-                        if hb_name == "converge":
-                            manager.do_converge()
-                            continue
-                        if runtime.worktree_path:
-                            adapter = ADAPTERS.get(runtime.agent_config.runtime)
-                            if adapter:
-                                adapter().deliver_message(
-                                    runtime.worktree_path,
-                                    "manager",
-                                    f"HEARTBEAT [{hb_name}]: Time to {hb_name}. "
-                                    f"Check the leaderboard (evolution attempts list), "
-                                    f"read shared notes (evolution notes list), "
-                                    f"and share what you've learned.",
-                                )
-                                adapter().consolidate_inbox(runtime.worktree_path)
-                elif runtime.heartbeat is not None and runtime.heartbeat.should_fire():
-                    runtime.heartbeat.reset()
-                    logger.info("Heartbeat fired for agent %s", name)
-                    if runtime.worktree_path:
-                        adapter = ADAPTERS.get(runtime.agent_config.runtime)
-                        if adapter:
-                            adapter().deliver_message(
-                                runtime.worktree_path,
-                                "manager",
-                                "HEARTBEAT: Pause and reflect. "
-                                "Check the leaderboard (evolution attempts list), "
-                                "read shared notes (evolution notes list), "
-                                "and share what you've learned.",
-                            )
-                            adapter().consolidate_inbox(runtime.worktree_path)
+            # Check agent health and fire heartbeats (thread-safe)
+            manager.tick()
 
             # Persist state
             manager.save_state()

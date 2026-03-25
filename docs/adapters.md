@@ -22,6 +22,10 @@ class AgentAdapter:
 
     def deliver_message(self, worktree_path: Path, sender: str, message: str) -> Path:
         """Write a message to the agent's inbox. (Inherited from base class.)"""
+
+    @staticmethod
+    def clean_env(overrides: dict[str, str] | None = None) -> dict[str, str]:
+        """Build a clean env: os.environ + overrides, with VIRTUAL_ENV/PYTHONPATH/PYTHONHOME stripped."""
 ```
 
 ## Example: Claude Code Adapter
@@ -30,6 +34,7 @@ class AgentAdapter:
 class ClaudeCodeAdapter(AgentAdapter):
     name = "claude-code"
     instruction_file = "CLAUDE.md"
+    default_runtime_options = {"permission_mode": "dangerously-skip-permissions"}
 
     def provision(self, worktree_path, agent_config):
         # Write .claude/settings.json with plugins
@@ -40,9 +45,11 @@ class ClaudeCodeAdapter(AgentAdapter):
         (worktree_path / "CLAUDE.md").write_text(f"# Instructions\n{prompt}\n{task_description}")
 
     def spawn(self, worktree_path, agent_config):
-        env = {**os.environ, **(agent_config.env or {})}
+        env = self.clean_env(agent_config.env)
+        opts = {**self.default_runtime_options, **agent_config.runtime_options}
+        permission_flag = f"--{opts['permission_mode']}"
         return subprocess.Popen(
-            ["claude", "--dangerously-skip-permissions", "-p", "Read CLAUDE.md and begin."],
+            ["claude", permission_flag, "-p", "Read CLAUDE.md and begin."],
             cwd=str(worktree_path),
             env=env,
         )
@@ -74,16 +81,17 @@ agents:
 
 ## Key Requirements
 
-1. **`spawn()` must return a `subprocess.Popen`** — the manager uses `process.poll()` to check health
-2. **`provision()` runs before `write_instructions()`** — config files first, then instructions
-3. **Instruction file should tell the agent about the `evolution` CLI** — agents need to know how to submit evals and share notes
-4. **Environment variables pass through** — `agent_config.env` merges with `os.environ`
-5. **Messages are delivered via filesystem** — the base class `deliver_message()` handles this; agents should check `.evolution/inbox/`
+1. **`spawn()` must return a `subprocess.Popen`**: the manager uses `process.poll()` to check health
+2. **`provision()` runs before `write_instructions()`**: config files first, then instructions
+3. **Instruction file should tell the agent about the `evolution` CLI**: agents need to know how to submit evals and share notes
+4. **Use `self.clean_env(agent_config.env)` for subprocess env**: this merges `agent_config.env` onto `os.environ` and strips `VIRTUAL_ENV`, `PYTHONPATH`, `PYTHONHOME` to prevent venv leakage
+5. **Derive permission flags from `runtime_options`**: define `default_runtime_options` on your adapter class and merge with `agent_config.runtime_options` in `spawn()`
+6. **Messages are delivered via filesystem**: the base class `deliver_message()` handles this; agents should check `.evolution/inbox/`
 
 ## Existing Adapters
 
 | Adapter | Runtime | Instruction File | Spawn Command |
 |---------|---------|-----------------|---------------|
 | `ClaudeCodeAdapter` | `claude-code` | `CLAUDE.md` | `claude --dangerously-skip-permissions -p` |
-| `CodexAdapter` | `codex` | `AGENTS.md` | `codex --full-auto` |
+| `CodexAdapter` | `codex` | `AGENTS.md` | `codex exec --dangerously-bypass-approvals-and-sandbox` |
 | `OpenCodeAdapter` | `opencode` | `AGENTS.md` | `opencode` |

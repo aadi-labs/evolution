@@ -88,6 +88,21 @@ def test_agent_config_full():
     assert agent.env["FOO"] == "bar"
 
 
+def test_agent_config_runtime_options_default():
+    agent = AgentConfig(role="r", runtime="rt")
+    assert agent.runtime_options == {}
+
+
+def test_agent_config_runtime_options_custom():
+    agent = AgentConfig(
+        role="r",
+        runtime="rt",
+        runtime_options={"permission_mode": "enable-auto-mode", "fast_mode": True},
+    )
+    assert agent.runtime_options["permission_mode"] == "enable-auto-mode"
+    assert agent.runtime_options["fast_mode"] is True
+
+
 # ---------- TaskConfig – single metric ----------
 
 

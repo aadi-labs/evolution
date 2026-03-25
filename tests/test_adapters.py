@@ -100,7 +100,7 @@ class TestDeliverMessage:
 
 
 class TestSpawn:
-    def test_spawn_calls_claude_cli(self, tmp_path: Path):
+    def test_spawn_calls_claude_cli_with_default_permission_mode(self, tmp_path: Path):
         adapter = ClaudeCodeAdapter()
         config = _make_agent_config(env={"CUSTOM": "val"})
 
@@ -116,7 +116,32 @@ class TestSpawn:
             assert kwargs["cwd"] == str(tmp_path)
             assert kwargs["env"]["CUSTOM"] == "val"
 
-    def test_spawn_empty_env_inherits_os_environ(self, tmp_path: Path):
+    def test_spawn_uses_custom_permission_mode(self, tmp_path: Path):
+        adapter = ClaudeCodeAdapter()
+        config = _make_agent_config(
+            runtime_options={"permission_mode": "enable-auto-mode"},
+        )
+
+        with patch("evolution.adapters.claude_code.subprocess.Popen") as mock_popen:
+            adapter.spawn(tmp_path, config)
+
+            args, _ = mock_popen.call_args
+            cmd = args[0]
+            assert "--enable-auto-mode" in cmd
+            assert "--dangerously-skip-permissions" not in cmd
+
+    def test_spawn_env_strips_virtual_env(self, tmp_path: Path):
+        adapter = ClaudeCodeAdapter()
+        config = _make_agent_config(env={"VIRTUAL_ENV": "/bad/venv", "KEEP": "yes"})
+
+        with patch("evolution.adapters.claude_code.subprocess.Popen") as mock_popen:
+            adapter.spawn(tmp_path, config)
+
+            _, kwargs = mock_popen.call_args
+            assert "VIRTUAL_ENV" not in kwargs["env"]
+            assert kwargs["env"]["KEEP"] == "yes"
+
+    def test_spawn_empty_env_still_cleans(self, tmp_path: Path):
         adapter = ClaudeCodeAdapter()
         config = _make_agent_config(env={})
 
@@ -124,8 +149,8 @@ class TestSpawn:
             adapter.spawn(tmp_path, config)
 
             _, kwargs = mock_popen.call_args
-            # Empty env still merges with os.environ (agents inherit parent env)
             assert isinstance(kwargs["env"], dict)
+            assert "VIRTUAL_ENV" not in kwargs["env"]
 
 
 class TestBaseAdapterRaisesNotImplemented:
@@ -154,3 +179,30 @@ class TestBaseAdapterRaisesNotImplemented:
             assert False, "Should have raised NotImplementedError"
         except NotImplementedError:
             pass
+
+
+class TestCleanEnv:
+    def test_strips_virtual_env(self):
+        env = {"VIRTUAL_ENV": "/some/venv", "PATH": "/usr/bin", "HOME": "/home/user"}
+        result = AgentAdapter.clean_env(env)
+        assert "VIRTUAL_ENV" not in result
+        assert result["PATH"] == "/usr/bin"
+        assert result["HOME"] == "/home/user"
+
+    def test_strips_pythonpath_and_pythonhome(self):
+        env = {"PYTHONPATH": "/lib", "PYTHONHOME": "/home", "OTHER": "keep"}
+        result = AgentAdapter.clean_env(env)
+        assert "PYTHONPATH" not in result
+        assert "PYTHONHOME" not in result
+        assert result["OTHER"] == "keep"
+
+    def test_none_overrides_uses_os_environ(self):
+        result = AgentAdapter.clean_env(None)
+        assert "VIRTUAL_ENV" not in result
+        # Should contain typical env vars from os.environ
+        assert isinstance(result, dict)
+
+    def test_merges_overrides_onto_os_environ(self):
+        result = AgentAdapter.clean_env({"MY_CUSTOM": "val"})
+        assert result["MY_CUSTOM"] == "val"
+        assert "VIRTUAL_ENV" not in result

@@ -1,6 +1,7 @@
 """Skills hub — file-based storage for reusable agent skills."""
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,7 @@ class SkillsHub:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
 
     def add(self, author: str, name: str, content: str, tags: list[str] | None = None) -> Skill:
         """Add a new skill and write it to a markdown file."""
@@ -48,14 +50,15 @@ class SkillsHub:
         file_content = "---\n" + yaml.dump(frontmatter, default_flow_style=False) + "---\n" + body + "\n"
 
         filename = f"{name}.md"
-        (self.path / filename).write_text(file_content)
+        with self._lock:
+            (self.path / filename).write_text(file_content)
 
         return skill
 
     def list(self) -> list[Skill]:
         """Read all skill files, sorted by filename."""
         skills = []
-        for f in sorted(self.path.glob("*.md")):
+        for f in sorted(self.path.glob("*.md"), reverse=True):
             skill = self._read(f)
             if skill is not None:
                 skills.append(skill)

@@ -74,7 +74,7 @@ class TestAttemptsHub:
 
         attempts = hub.list()
         assert len(attempts) == 3
-        assert [a.id for a in attempts] == [1, 2, 3]
+        assert [a.id for a in attempts] == [3, 2, 1]
 
     def test_get_existing(self, tmp_path: Path) -> None:
         hub = AttemptsHub(tmp_path / "attempts")
@@ -217,6 +217,49 @@ class TestNotesHub:
         deep = tmp_path / "x" / "y"
         hub = NotesHub(deep)
         assert deep.exists()
+
+    def test_list_sorted_by_timestamp(self, tmp_path: Path) -> None:
+        """Notes should be sorted by frontmatter timestamp, not filename."""
+        hub = NotesHub(tmp_path / "notes")
+
+        # Add notes — but manually overwrite timestamps to be out of filename order
+        n1 = hub.add("agent-a", "first added")
+        n2 = hub.add("agent-b", "second added")
+        n3 = hub.add("agent-a", "third added")
+
+        # Rewrite note 3 to have the earliest timestamp
+        f3 = tmp_path / "notes" / "003-agent-a.md"
+        content = f3.read_text()
+        content = content.replace(n3.timestamp, "2020-01-01T00:00:00+00:00")
+        f3.write_text(content)
+
+        # Rewrite note 1 to have the latest timestamp
+        f1 = tmp_path / "notes" / "001-agent-a.md"
+        content = f1.read_text()
+        content = content.replace(n1.timestamp, "2099-12-31T23:59:59+00:00")
+        f1.write_text(content)
+
+        notes = hub.list()
+        assert len(notes) == 3
+        # Should be sorted by timestamp: note3 (2020), note2 (original), note1 (2099)
+        assert notes[0].text == "third added"
+        assert notes[2].text == "first added"
+
+    def test_list_sorts_by_mtime_when_no_timestamp(self, tmp_path: Path) -> None:
+        """Notes without a timestamp should fall back to file mtime."""
+        notes_dir = tmp_path / "notes"
+        notes_dir.mkdir(parents=True)
+
+        # Write a note file without a timestamp in frontmatter
+        import yaml
+        fm = {"agent": "agent-x", "tags": []}
+        content = "---\n" + yaml.dump(fm) + "---\nno timestamp note\n"
+        (notes_dir / "001-agent-x.md").write_text(content)
+
+        hub = NotesHub(notes_dir)
+        notes = hub.list()
+        assert len(notes) == 1
+        assert notes[0].text == "no timestamp note"
 
 
 # ── Skills ───────────────────────────────────────────────────────────────

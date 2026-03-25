@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from evolution.manager.config import AgentConfig, HeartbeatConfig, RoleConfig
+from evolution.manager.config import AgentConfig, RoleConfig
 from evolution.manager.heartbeat import HeartbeatTracker, MultiHeartbeatTracker, parse_duration
 
 

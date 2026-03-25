@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,8 @@ class NotesHub:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._next_id_counter = self._compute_next_id()
 
     def _compute_next_id(self) -> int:
         ids = []
@@ -35,7 +38,9 @@ class NotesHub:
 
     def add(self, agent: str, text: str, tags: list[str] | None = None) -> Note:
         """Add a new note and write it to a markdown file."""
-        note_id = self._compute_next_id()
+        with self._lock:
+            note_id = self._next_id_counter
+            self._next_id_counter += 1
         timestamp = datetime.now(timezone.utc).isoformat()
 
         note = Note(
@@ -60,14 +65,20 @@ class NotesHub:
         return note
 
     def list(self, agent: str | None = None) -> list[Note]:
-        """Read all note files, optionally filtered by agent."""
-        notes = []
-        for f in sorted(self.path.glob("*.md")):
+        """Read all note files, optionally filtered by agent.
+
+        Notes are sorted by frontmatter timestamp (earliest first),
+        falling back to file mtime when timestamp is empty.
+        """
+        notes: list[tuple[Note, Path]] = []
+        for f in self.path.glob("*.md"):
             note = self._read(f)
             if note is not None:
                 if agent is None or note.agent == agent:
-                    notes.append(note)
-        return notes
+                    notes.append((note, f))
+
+        notes.sort(key=lambda pair: pair[0].timestamp or datetime.fromtimestamp(pair[1].stat().st_mtime, tz=timezone.utc).isoformat())
+        return [n for n, _ in notes]
 
     def _read(self, filepath: Path) -> Note | None:
         """Parse a markdown note file with YAML frontmatter."""

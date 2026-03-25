@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import subprocess
 from pathlib import Path
 
@@ -31,18 +30,24 @@ class CodexAdapter(AgentAdapter):
             )
         )
 
+    # Default runtime options for Codex
+    default_runtime_options: dict = {"permission_mode": "dangerously-bypass-approvals-and-sandbox"}
+
     def spawn(
         self, worktree_path: Path, agent_config: AgentConfig
     ) -> subprocess.Popen:
         """Start ``codex exec`` (non-interactive) in the worktree."""
-        env = {**os.environ, **agent_config.env} if agent_config.env else None
+        env = self.clean_env(agent_config.env)
+
+        opts = {**self.default_runtime_options, **agent_config.runtime_options}
+        permission_flag = f"--{opts['permission_mode']}"
 
         # Read the instruction file as the initial prompt
         instruction_path = worktree_path / self.instruction_file
         prompt = instruction_path.read_text() if instruction_path.exists() else "Start working."
 
         return subprocess.Popen(
-            ["codex", "exec", prompt],
+            ["codex", "exec", permission_flag, prompt],
             cwd=str(worktree_path),
             env=env,
         )

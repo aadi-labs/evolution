@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,9 +32,13 @@ class HypothesisHub:
     def __init__(self, directory: Path) -> None:
         self._dir = Path(directory)
         self._dir.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._next_id_counter = self._compute_next_id_counter()
 
     def add(self, agent: str, hypothesis: str, metric: str) -> Hypothesis:
-        next_id = self._next_id()
+        with self._lock:
+            next_id = self._next_id_counter
+            self._next_id_counter += 1
         h = Hypothesis(
             id=f"H-{next_id}",
             agent=agent,
@@ -58,16 +63,17 @@ class HypothesisHub:
         return all_h
 
     def resolve(self, hypothesis_id: str, status: str, resolved_by: str, evidence: str) -> Hypothesis | None:
-        h = self.get(hypothesis_id)
-        if h is None:
-            return None
-        h.status = status
-        h.resolved_by = resolved_by
-        h.evidence = evidence
-        self._write(h)
-        return h
+        with self._lock:
+            h = self.get(hypothesis_id)
+            if h is None:
+                return None
+            h.status = status
+            h.resolved_by = resolved_by
+            h.evidence = evidence
+            self._write(h)
+            return h
 
-    def _next_id(self) -> int:
+    def _compute_next_id_counter(self) -> int:
         existing = self._read_all()
         if not existing:
             return 1
@@ -97,7 +103,7 @@ class HypothesisHub:
 
     def _read_all(self) -> list[Hypothesis]:
         results = []
-        for path in sorted(self._dir.glob("H-*.md")):
+        for path in sorted(self._dir.glob("H-*.md"), reverse=True):
             try:
                 text = path.read_text()
                 if text.startswith("---"):

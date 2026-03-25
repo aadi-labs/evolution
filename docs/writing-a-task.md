@@ -101,8 +101,8 @@ evolution run --config evolution.yaml
 ## Tips
 
 - **Start with one agent** to validate the pipeline, then scale to 2-4
-- **Set milestones** if you have baseline scores — agents get notified when milestones are reached
+- **Set milestones** if you have baseline scores. Agents get notified when milestones are reached
 - **Use stagnation shake-up** (`stagnation_action: shake_up`) for long sessions
-- **The grader runs in the agent's worktree** — each agent has its own copy of the code
+- **The grader runs in the agent's worktree**: each agent has its own copy of the code
 - **Pre-compute expensive data** (embeddings, datasets) and put it in a symlinked directory so all agents share it
-- **Keep grader runtime under 5 minutes** — agents iterate faster with quick feedback
+- **Keep grader runtime under 5 minutes**: agents iterate faster with quick feedback

@@ -2,11 +2,27 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
 from evolution.manager.config import AgentConfig
+
+
+def clean_env(overrides: dict[str, str] | None = None) -> dict[str, str]:
+    """Build a process environment with Evolution's own venv vars stripped.
+
+    Parameters
+    ----------
+    overrides:
+        Extra env vars to merge on top of ``os.environ``.
+        Pass ``agent_config.env`` here.
+    """
+    base = {**os.environ, **(overrides or {})}
+    for key in ("VIRTUAL_ENV", "PYTHONPATH", "PYTHONHOME"):
+        base.pop(key, None)
+    return base
 
 
 class AgentAdapter:
@@ -96,7 +112,10 @@ class AgentAdapter:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S-%f")
         filename = f"{timestamp}-{agent_name}.md"
         msg_path = inbox / filename
-        msg_path.write_text(message)
+        # Atomic write: write to temp file then rename so readers never see partial content
+        tmp_path = msg_path.with_suffix(".tmp")
+        tmp_path.write_text(message)
+        tmp_path.rename(msg_path)
         return msg_path
 
     def consolidate_inbox(self, worktree_path: Path) -> Path | None:
@@ -122,3 +141,8 @@ class AgentAdapter:
         digest_path = inbox / f"DIGEST-{timestamp}.md"
         digest_path.write_text("\n\n---\n\n".join(lines))
         return digest_path
+
+    @staticmethod
+    def clean_env(overrides: dict[str, str] | None = None) -> dict[str, str]:
+        """Delegate to module-level ``clean_env``."""
+        return clean_env(overrides)

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 from pathlib import Path
 
@@ -45,6 +44,9 @@ class ClaudeCodeAdapter(AgentAdapter):
 
     name: str = "claude-code"
     instruction_file: str = "CLAUDE.md"
+
+    # Default runtime options for Claude Code
+    default_runtime_options: dict = {"permission_mode": "dangerously-skip-permissions"}
 
     def provision(self, worktree_path: Path, agent_config: AgentConfig) -> None:
         """Write ``.claude/settings.json`` with plugins and ``.mcp.json`` with MCP servers.
@@ -111,14 +113,11 @@ class ClaudeCodeAdapter(AgentAdapter):
     def spawn(
         self, worktree_path: Path, agent_config: AgentConfig
     ) -> subprocess.Popen:
-        """Start ``claude`` in print mode in the worktree.
+        """Start ``claude`` in print mode in the worktree."""
+        env = self.clean_env(agent_config.env)
 
-        Claude Code runs a full agentic loop in ``--print`` mode (tool
-        calls, file edits, bash commands) and handles context compaction
-        internally.  The agent should keep working autonomously for the
-        entire evolution session without needing restarts.
-        """
-        env = {**os.environ, **(agent_config.env or {})}
+        opts = {**self.default_runtime_options, **agent_config.runtime_options}
+        permission_flag = f"--{opts['permission_mode']}"
 
         prompt = (
             "You are an autonomous evolution agent. Read CLAUDE.md for your full instructions.\n\n"
@@ -133,7 +132,7 @@ class ClaudeCodeAdapter(AgentAdapter):
         )
 
         return subprocess.Popen(
-            ["claude", "--dangerously-skip-permissions", "-p", prompt],
+            ["claude", permission_flag, "-p", prompt],
             cwd=str(worktree_path),
             env=env,
         )

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +31,7 @@ class AttemptsHub:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
         self._next_id = self._compute_next_id()
 
     def _compute_next_id(self) -> int:
@@ -50,8 +52,9 @@ class AttemptsHub:
         metrics: dict[str, float] | None = None,
     ) -> Attempt:
         """Record a new attempt and write it to a markdown file."""
-        attempt_id = self._next_id
-        self._next_id += 1
+        with self._lock:
+            attempt_id = self._next_id
+            self._next_id += 1
         timestamp = datetime.now(timezone.utc).isoformat()
 
         # Determine previous best and improvement
@@ -83,7 +86,7 @@ class AttemptsHub:
     def list(self) -> list[Attempt]:
         """Read all attempt files, sorted by filename."""
         attempts = []
-        for f in sorted(self.path.glob("*.md")):
+        for f in sorted(self.path.glob("*.md"), reverse=True):
             attempt = self._read(f)
             if attempt is not None:
                 attempts.append(attempt)

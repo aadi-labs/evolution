@@ -68,11 +68,11 @@ def format_report(hub: AttemptsHub, direction: str = "lower_is_better") -> str:
 
 
 def export_csv(hub: AttemptsHub, output_path: str) -> None:
-    """Write all attempts to a CSV file.
+    """Write all attempts to a CSV file in chronological order.
 
     Columns: id, agent, score, timestamp, commit
     """
-    attempts = hub.list()
+    attempts = list(reversed(hub.list()))
     with open(output_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["id", "agent", "score", "timestamp", "commit"])

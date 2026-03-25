@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -78,12 +79,18 @@ class Manager:
         self._session_start: float = time.monotonic()
         self._shake_up_count = 0
 
+        # Thread safety: protects all shared mutable state accessed by the
+        # socket server thread, the eval-worker thread, and the main loop.
+        self._lock = threading.Lock()
+
         # Grader (set up from config)
         self._grader: ScriptGrader | None = None
+        self._grader_timeout: int = 1800
         if config.task.grader:
             script = config.task.grader.get("script")
             if script:
                 self._grader = ScriptGrader(script)
+            self._grader_timeout = config.task.grader.get("timeout", 1800)
 
         # Metric direction
         self._direction = "lower_is_better"
@@ -192,53 +199,59 @@ class Manager:
         """Route an incoming JSON request to the appropriate handler."""
         req_type = request.get("type", "")
         try:
+            # Eval handles its own locking to avoid holding the lock during grading
             if req_type == "eval":
                 return self._handle_eval(request)
-            elif req_type == "note":
-                return self._handle_note(request)
-            elif req_type == "skill":
-                return self._handle_skill(request)
-            elif req_type == "status":
-                return self._handle_status(request)
-            elif req_type == "attempts_list":
-                return self._handle_attempts_list(request)
-            elif req_type == "attempts_show":
-                return self._handle_attempts_show(request)
-            elif req_type == "notes_list":
-                return self._handle_notes_list(request)
-            elif req_type == "skills_list":
-                return self._handle_skills_list(request)
-            elif req_type == "msg":
-                return self._handle_msg(request)
-            elif req_type == "pause":
-                return self._handle_pause(request)
-            elif req_type == "resume":
-                return self._handle_resume(request)
-            elif req_type == "kill":
-                return self._handle_kill(request)
-            elif req_type == "spawn":
-                return self._handle_spawn(request)
-            elif req_type == "claims":
-                return self._handle_claims(request)
-            elif req_type == "diff":
-                return self._handle_diff(request)
-            elif req_type == "cherry_pick":
-                return self._handle_cherry_pick(request)
-            elif req_type == "hypothesis_add":
-                return self._handle_hypothesis_add(request)
-            elif req_type == "hypothesis_list":
-                return self._handle_hypothesis_list(request)
-            elif req_type == "hypothesis_resolve":
-                return self._handle_hypothesis_resolve(request)
-            elif req_type == "stop":
-                return self._handle_stop(request)
-            elif req_type == "merge":
-                return self._handle_merge(request)
-            else:
-                return {"error": f"Unknown request type: {req_type}"}
+            with self._lock:
+                return self._dispatch_locked(req_type, request)
         except Exception as exc:
             logger.exception("Error handling request type=%s", req_type)
             return {"error": str(exc)}
+
+    def _dispatch_locked(self, req_type: str, request: dict) -> dict:
+        """Route non-eval requests. Caller must hold self._lock."""
+        if req_type == "note":
+            return self._handle_note(request)
+        elif req_type == "skill":
+            return self._handle_skill(request)
+        elif req_type == "status":
+            return self._handle_status(request)
+        elif req_type == "attempts_list":
+            return self._handle_attempts_list(request)
+        elif req_type == "attempts_show":
+            return self._handle_attempts_show(request)
+        elif req_type == "notes_list":
+            return self._handle_notes_list(request)
+        elif req_type == "skills_list":
+            return self._handle_skills_list(request)
+        elif req_type == "msg":
+            return self._handle_msg(request)
+        elif req_type == "pause":
+            return self._handle_pause(request)
+        elif req_type == "resume":
+            return self._handle_resume(request)
+        elif req_type == "kill":
+            return self._handle_kill(request)
+        elif req_type == "spawn":
+            return self._handle_spawn(request)
+        elif req_type == "claims":
+            return self._handle_claims(request)
+        elif req_type == "diff":
+            return self._handle_diff(request)
+        elif req_type == "cherry_pick":
+            return self._handle_cherry_pick(request)
+        elif req_type == "hypothesis_add":
+            return self._handle_hypothesis_add(request)
+        elif req_type == "hypothesis_list":
+            return self._handle_hypothesis_list(request)
+        elif req_type == "hypothesis_resolve":
+            return self._handle_hypothesis_resolve(request)
+        elif req_type == "stop":
+            return self._handle_stop(request)
+        elif req_type == "merge":
+            return self._handle_merge(request)
+        else:
+            return {"error": f"Unknown request type: {req_type}"}
 
     # ------------------------------------------------------------------
     # Phase tracking
@@ -252,52 +265,54 @@ class Manager:
 
     def check_phase_transition(self) -> None:
         """Advance to next phase if current phase duration expired."""
-        if not self._phases or self._current_phase_index >= len(self._phases):
-            return
-        phase = self._phases[self._current_phase_index]
-        if phase.duration is None:
-            return
-        elapsed = time.monotonic() - self._phase_start
-        if elapsed >= parse_duration(phase.duration):
-            self._current_phase_index += 1
-            self._phase_start = time.monotonic()
-            next_name = (
-                self._phases[self._current_phase_index].name
-                if self._current_phase_index < len(self._phases)
-                else "default"
-            )
-            self._broadcast_message(
-                "manager",
-                f"[PHASE] Phase '{phase.name}' complete. Entering '{next_name}' phase.",
-            )
+        with self._lock:
+            if not self._phases or self._current_phase_index >= len(self._phases):
+                return
+            phase = self._phases[self._current_phase_index]
+            if phase.duration is None:
+                return
+            elapsed = time.monotonic() - self._phase_start
+            if elapsed >= parse_duration(phase.duration):
+                self._current_phase_index += 1
+                self._phase_start = time.monotonic()
+                next_name = (
+                    self._phases[self._current_phase_index].name
+                    if self._current_phase_index < len(self._phases)
+                    else "default"
+                )
+                self._broadcast_message(
+                    "manager",
+                    f"[PHASE] Phase '{phase.name}' complete. Entering '{next_name}' phase.",
+                )
 
     # ------------------------------------------------------------------
     # Handlers
     # ------------------------------------------------------------------
 
     def _handle_eval(self, request: dict) -> dict:
-        if self.is_eval_blocked():
-            return {"status": "rejected", "reason": "Research phase active. Share findings with: evolution note add"}
+        with self._lock:
+            if self.is_eval_blocked():
+                return {"status": "rejected", "reason": "Research phase active. Share findings with: evolution note add"}
 
-        agent_name = request.get("agent", "")
-        description = request.get("description", "")
+            agent_name = request.get("agent", "")
+            description = request.get("description", "")
 
-        runtime = self.agents.get(agent_name)
-        if runtime is None:
-            return {"error": f"Unknown agent: {agent_name}"}
+            runtime = self.agents.get(agent_name)
+            if runtime is None:
+                return {"error": f"Unknown agent: {agent_name}"}
 
-        if runtime.paused:
-            return {"error": f"Agent {agent_name} is paused"}
+            if runtime.paused:
+                return {"error": f"Agent {agent_name} is paused"}
 
-        wt_path = runtime.worktree_path
-        if wt_path is None:
-            return {"error": f"Agent {agent_name} has no worktree"}
+            wt_path = runtime.worktree_path
+            if wt_path is None:
+                return {"error": f"Agent {agent_name} has no worktree"}
 
-        # When an eval queue is configured, submit and return immediately
-        if self._eval_queue is not None:
-            return self._eval_queue.submit(agent_name, description)
+            # When an eval queue is configured, submit and return immediately
+            if self._eval_queue is not None:
+                return self._eval_queue.submit(agent_name, description)
 
-        # Otherwise, grade synchronously (preserves existing behaviour)
+        # Synchronous grading — lock released so main loop and other requests aren't blocked
         return self.grade_and_record(agent_name, description)
 
     def grade_and_record(self, agent_name: str, description: str) -> dict:
@@ -305,70 +320,74 @@ class Manager:
 
         This method is called either synchronously from ``_handle_eval`` or
         asynchronously by the eval-worker thread when an ``EvalQueue`` is active.
+        The lock is acquired only around state reads and writes, not during grading.
         """
-        runtime = self.agents.get(agent_name)
-        if runtime is None:
-            return {"error": f"Unknown agent: {agent_name}"}
+        # Phase 1: snapshot what we need under lock
+        with self._lock:
+            runtime = self.agents.get(agent_name)
+            if runtime is None:
+                return {"error": f"Unknown agent: {agent_name}"}
+            wt_path = runtime.worktree_path
+            if wt_path is None:
+                return {"error": f"Agent {agent_name} has no worktree"}
 
-        wt_path = runtime.worktree_path
-        if wt_path is None:
-            return {"error": f"Agent {agent_name} has no worktree"}
-
-        # Synthetic commit hash (no git operations)
-        commit_hash = f"eval-{agent_name}-{len(self.attempts_hub.list()) + 1}"
-
-        # Run grader
+        # Phase 2: run grader without lock (can be slow)
         score = None
         feedback = "No grader configured"
         metrics: dict[str, float] = {}
         if self._grader:
-            grade_result = self._grader.grade(str(wt_path))
+            grade_result = self._grader.grade(str(wt_path), timeout=self._grader_timeout)
             score = grade_result.score
             feedback = grade_result.feedback
             metrics = grade_result.metrics
 
-        # Record attempt
-        attempt = self.attempts_hub.record(
-            agent=agent_name,
-            score=score,
-            description=description,
-            commit=commit_hash,
-            feedback=feedback,
-            metrics=metrics,
-        )
+        # Phase 3: record results under lock
+        with self._lock:
+            commit_hash = f"eval-{agent_name}-{len(self.attempts_hub.list()) + 1}"
 
-        # Track heartbeat
-        if runtime.multi_heartbeat is not None:
-            runtime.multi_heartbeat.record_attempt()
-        elif runtime.heartbeat is not None:
-            runtime.heartbeat.record_attempt()
+            attempt = self.attempts_hub.record(
+                agent=agent_name,
+                score=score,
+                description=description,
+                commit=commit_hash,
+                feedback=feedback,
+                metrics=metrics,
+            )
 
-        # Check improvement
-        if score is not None:
-            self._check_improvement(score, agent_name, self._direction)
+            # Track heartbeat — re-fetch runtime in case it was killed during grading
+            runtime = self.agents.get(agent_name)
+            if runtime is not None:
+                if runtime.multi_heartbeat is not None:
+                    runtime.multi_heartbeat.record_attempt()
+                elif runtime.heartbeat is not None:
+                    runtime.heartbeat.record_attempt()
 
-        # Broadcast leaderboard update
-        board = self.attempts_hub.leaderboard(self._direction)
-        top3 = ", ".join(f"{a.agent}={a.score}" for a in board[:3])
-        self._broadcast_message("manager", f"[LEADERBOARD] {agent_name} scored {score}. Top 3: {top3}")
+            # Check improvement
+            if score is not None:
+                self._check_improvement(score, agent_name, self._direction)
 
-        result = {
-            "status": "ok",
-            "attempt_id": attempt.id,
-            "score": score,
-            "feedback": feedback,
-            "improvement": attempt.improvement,
-        }
+            # Broadcast leaderboard update
+            board = self.attempts_hub.leaderboard(self._direction)
+            top3 = ", ".join(f"{a.agent}={a.score}" for a in board[:3])
+            self._broadcast_message("manager", f"[LEADERBOARD] {agent_name} scored {score}. Top 3: {top3}")
 
-        # Deliver result to agent's inbox when running asynchronously
-        if self._eval_queue is not None and runtime.worktree_path:
-            adapter = self._get_adapter(runtime)
-            if adapter:
-                msg = (
-                    f"Eval complete — score: {score}, feedback: {feedback}, "
-                    f"improvement: {attempt.improvement}"
-                )
-                adapter.deliver_message(runtime.worktree_path, "manager", msg)
+            result = {
+                "status": "ok",
+                "attempt_id": attempt.id,
+                "score": score,
+                "feedback": feedback,
+                "improvement": attempt.improvement,
+            }
+
+            # Deliver result to agent's inbox when running asynchronously
+            if self._eval_queue is not None and runtime is not None and runtime.worktree_path:
+                adapter = self._get_adapter(runtime)
+                if adapter:
+                    msg = (
+                        f"Eval complete — score: {score}, feedback: {feedback}, "
+                        f"improvement: {attempt.improvement}"
+                    )
+                    adapter.deliver_message(runtime.worktree_path, "manager", msg)
 
         return result
 
@@ -653,6 +672,8 @@ class Manager:
 
     def _handle_claims(self, request: dict) -> dict:
         """Return active work claims across all agents."""
+        # Notes are sorted oldest-first (by timestamp); iterate in
+        # chronological order to correctly process WORKING ON → DONE transitions.
         notes = self.notes_hub.list()
         active: dict[str, dict] = {}
         for note in notes:
@@ -948,71 +969,168 @@ class Manager:
         str | None
             A reason string if we should stop, or None to continue.
         """
-        stop = self.config.task.stop
+        with self._lock:
+            stop = self.config.task.stop
 
-        # Max time
-        max_time_secs = parse_duration(stop.max_time)
-        elapsed = time.monotonic() - self._session_start
-        if elapsed >= max_time_secs:
-            return f"Max time reached ({stop.max_time})"
+            # Max time
+            max_time_secs = parse_duration(stop.max_time)
+            elapsed = time.monotonic() - self._session_start
+            if elapsed >= max_time_secs:
+                return f"Max time reached ({stop.max_time})"
 
-        # Max attempts
-        if stop.max_attempts is not None:
-            total = len(self.attempts_hub.list())
-            if total >= stop.max_attempts:
-                return f"Max attempts reached ({stop.max_attempts})"
+            # Max attempts
+            if stop.max_attempts is not None:
+                total = len(self.attempts_hub.list())
+                if total >= stop.max_attempts:
+                    return f"Max attempts reached ({stop.max_attempts})"
 
-        # Stagnation
-        stagnation_secs = parse_duration(stop.stagnation)
-        stagnation_elapsed = time.monotonic() - self._stagnation_start
-        if stagnation_elapsed >= stagnation_secs:
-            if stop.stagnation_action == "shake_up" and self._shake_up_count < stop.shake_up_budget:
-                # Deliver shake-up message and reset timer
-                self._broadcast_message(
-                    "manager",
-                    "SHAKE UP: No improvement detected. Try a radically different approach!",
-                )
-                self._stagnation_start = time.monotonic()
-                self._shake_up_count += 1
-                return None
-            else:
-                return f"Stagnation detected (no improvement for {stop.stagnation})"
-
-        # Milestone stop
-        if stop.milestone_stop and self._best_score is not None:
-            milestones = self.config.task.milestones
-            threshold = getattr(milestones, stop.milestone_stop, None)
-            if threshold is not None:
-                if self._direction == "lower_is_better":
-                    if self._best_score <= threshold:
-                        return f"Milestone '{stop.milestone_stop}' reached"
+            # Stagnation
+            stagnation_secs = parse_duration(stop.stagnation)
+            stagnation_elapsed = time.monotonic() - self._stagnation_start
+            if stagnation_elapsed >= stagnation_secs:
+                if stop.stagnation_action == "shake_up" and self._shake_up_count < stop.shake_up_budget:
+                    # Deliver shake-up message and reset timer
+                    self._broadcast_message(
+                        "manager",
+                        "SHAKE UP: No improvement detected. Try a radically different approach!",
+                    )
+                    self._stagnation_start = time.monotonic()
+                    self._shake_up_count += 1
+                    return None
                 else:
-                    if self._best_score >= threshold:
-                        return f"Milestone '{stop.milestone_stop}' reached"
+                    return f"Stagnation detected (no improvement for {stop.stagnation})"
 
-        return None
+            # Milestone stop
+            if stop.milestone_stop and self._best_score is not None:
+                milestones = self.config.task.milestones
+                threshold = getattr(milestones, stop.milestone_stop, None)
+                if threshold is not None:
+                    if self._direction == "lower_is_better":
+                        if self._best_score <= threshold:
+                            return f"Milestone '{stop.milestone_stop}' reached"
+                    else:
+                        if self._best_score >= threshold:
+                            return f"Milestone '{stop.milestone_stop}' reached"
+
+            return None
+
+    # ------------------------------------------------------------------
+    # Main-loop tick
+    # ------------------------------------------------------------------
+
+    def tick(self) -> None:
+        """Run one manager-loop iteration: agent health checks and heartbeats.
+
+        Called from the main thread in ``cmd_run``.  Acquires ``self._lock``
+        for the health-check and heartbeat portion, then calls ``do_converge``
+        (which handles its own locking) outside the lock.
+        """
+        needs_converge = False
+
+        with self._lock:
+            for name, runtime in list(self.agents.items()):
+                # -- agent health: restart if configured and dead --
+                if runtime.is_dead():
+                    restart_cfg = runtime.agent_config.restart
+                    if restart_cfg.enabled and runtime.restart_count < restart_cfg.max_restarts:
+                        adapter_cls = ADAPTERS.get(runtime.agent_config.runtime)
+                        if adapter_cls and runtime.worktree_path:
+                            adapter = adapter_cls()
+                            try:
+                                process = adapter.spawn(
+                                    runtime.worktree_path, runtime.agent_config
+                                )
+                                runtime.process = process
+                                runtime.restart_count += 1
+                                logger.info(
+                                    "Restarted agent %s (attempt %d/%d)",
+                                    name,
+                                    runtime.restart_count,
+                                    restart_cfg.max_restarts,
+                                )
+                            except Exception as exc:
+                                logger.error("Failed to restart agent %s: %s", name, exc)
+
+                # -- named heartbeats --
+                if runtime.multi_heartbeat is not None:
+                    pending = runtime.multi_heartbeat.get_pending()
+                    for hb_name in pending:
+                        logger.info(
+                            "Heartbeat '%s' fired for agent %s", hb_name, name
+                        )
+                        if hb_name == "converge":
+                            needs_converge = True
+                            continue
+                        if runtime.worktree_path:
+                            adapter = ADAPTERS.get(runtime.agent_config.runtime)
+                            if adapter:
+                                adapter().deliver_message(
+                                    runtime.worktree_path,
+                                    "manager",
+                                    f"HEARTBEAT [{hb_name}]: Time to {hb_name}. "
+                                    f"Check the leaderboard (evolution attempts list), "
+                                    f"read shared notes (evolution notes list), "
+                                    f"and share what you've learned.",
+                                )
+                                adapter().consolidate_inbox(runtime.worktree_path)
+
+                # -- legacy single heartbeat --
+                elif runtime.heartbeat is not None and runtime.heartbeat.should_fire():
+                    runtime.heartbeat.reset()
+                    logger.info("Heartbeat fired for agent %s", name)
+                    if runtime.worktree_path:
+                        adapter = ADAPTERS.get(runtime.agent_config.runtime)
+                        if adapter:
+                            adapter().deliver_message(
+                                runtime.worktree_path,
+                                "manager",
+                                "HEARTBEAT: Pause and reflect. "
+                                "Check the leaderboard (evolution attempts list), "
+                                "read shared notes (evolution notes list), "
+                                "and share what you've learned.",
+                            )
+                            adapter().consolidate_inbox(runtime.worktree_path)
+
+        # Convergence runs outside the lock (it handles its own locking)
+        if needs_converge:
+            self.do_converge()
 
     # ------------------------------------------------------------------
     # Convergence
     # ------------------------------------------------------------------
 
     def do_converge(self) -> None:
-        """Reset all agent worktrees to the best-scoring agent's code."""
-        if self._best_agent is None:
-            logger.info("Convergence skipped — no evals yet")
-            return
+        """Reset all agent worktrees to the best-scoring agent's code.
 
-        best_rt = self.agents.get(self._best_agent)
-        if best_rt is None or best_rt.worktree_path is None:
-            logger.warning("Convergence skipped — best agent %s not found", self._best_agent)
-            return
+        Pauses non-best agents during git operations to reduce interference,
+        then resumes them with a notification.
+        """
+        # Phase 1: snapshot state and pause agents under lock
+        with self._lock:
+            if self._best_agent is None:
+                logger.info("Convergence skipped — no evals yet")
+                return
 
-        best_branch = f"evolution/{self._best_agent}"
+            best_rt = self.agents.get(self._best_agent)
+            if best_rt is None or best_rt.worktree_path is None:
+                logger.warning("Convergence skipped — best agent %s not found", self._best_agent)
+                return
 
-        for name, rt in self.agents.items():
-            if name == self._best_agent or rt.worktree_path is None:
-                continue
+            best_agent = self._best_agent
+            best_score = self._best_score
+            best_branch = f"evolution/{best_agent}"
 
+            # Snapshot targets and pause them during convergence
+            targets: list[tuple[str, AgentRuntime]] = []
+            for name, rt in self.agents.items():
+                if name != best_agent and rt.worktree_path is not None:
+                    targets.append((name, rt))
+                    rt.paused = True
+
+            self._broadcast_message("manager", "[CONVERGE] Starting convergence — agents paused.")
+
+        # Phase 2: git operations without lock (these are slow and touch worktrees)
+        for name, rt in targets:
             try:
                 wt = str(rt.worktree_path)
                 # Snapshot current state
@@ -1027,19 +1145,22 @@ class Manager:
                     cwd=wt, capture_output=True, check=True,
                 )
                 subprocess.run(
-                    ["git", "commit", "-m", f"converge to {self._best_agent} (score {self._best_score})"],
+                    ["git", "commit", "-m", f"converge to {best_agent} (score {best_score})"],
                     cwd=wt, capture_output=True,
                 )
-                logger.info("Converged %s to %s", name, self._best_agent)
+                logger.info("Converged %s to %s", name, best_agent)
             except Exception as exc:
                 logger.error("Convergence failed for %s: %s", name, exc)
 
-        # Broadcast
-        self._broadcast_message(
-            "manager",
-            f"[CONVERGE] Rebased all worktrees to {self._best_agent}'s code (score {self._best_score}). "
-            f"Your previous changes are in git history (git diff HEAD~1). Build from this baseline.",
-        )
+        # Phase 3: resume agents under lock
+        with self._lock:
+            for name, rt in targets:
+                rt.paused = False
+            self._broadcast_message(
+                "manager",
+                f"[CONVERGE] Rebased all worktrees to {best_agent}'s code (score {best_score}). "
+                f"Your previous changes are in git history (git diff HEAD~1). Build from this baseline.",
+            )
 
     # ------------------------------------------------------------------
     # State persistence
@@ -1047,22 +1168,24 @@ class Manager:
 
     def save_state(self) -> None:
         """Write session state to .evolution/state.json."""
-        state: dict[str, Any] = {
-            "best_score": self._best_score,
-            "best_agent": self._best_agent,
-            "shake_up_count": self._shake_up_count,
-            "agents": {},
-        }
-        for name, rt in self.agents.items():
-            state["agents"][name] = {
-                "role": rt.agent_config.role,
-                "runtime": rt.agent_config.runtime,
-                "worktree_path": str(rt.worktree_path) if rt.worktree_path else None,
-                "restart_count": rt.restart_count,
-                "paused": rt.paused,
-                "alive": rt.is_alive(),
+        with self._lock:
+            state: dict[str, Any] = {
+                "best_score": self._best_score,
+                "best_agent": self._best_agent,
+                "shake_up_count": self._shake_up_count,
+                "agents": {},
             }
+            for name, rt in self.agents.items():
+                state["agents"][name] = {
+                    "role": rt.agent_config.role,
+                    "runtime": rt.agent_config.runtime,
+                    "worktree_path": str(rt.worktree_path) if rt.worktree_path else None,
+                    "restart_count": rt.restart_count,
+                    "paused": rt.paused,
+                    "alive": rt.is_alive(),
+                }
 
+        # Write file outside lock — no shared state accessed
         state_path = self.evolution_dir / "state.json"
         state_path.write_text(json.dumps(state, indent=2) + "\n")
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import subprocess
 
+from evolution.adapters.base import clean_env
 from evolution.grader.protocol import GradeResult
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,7 @@ class ScriptGrader:
                 capture_output=True,
                 text=True,
                 timeout=timeout,
+                env=clean_env(),
             )
 
             if result.returncode != 0:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import subprocess
 from pathlib import Path
 
@@ -35,7 +34,7 @@ class OpenCodeAdapter(AgentAdapter):
         self, worktree_path: Path, agent_config: AgentConfig
     ) -> subprocess.Popen:
         """Start ``opencode`` in the worktree."""
-        env = {**os.environ, **agent_config.env} if agent_config.env else None
+        env = self.clean_env(agent_config.env)
 
         return subprocess.Popen(
             ["opencode"],

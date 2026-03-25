@@ -25,6 +25,7 @@ task:
   grader:
     type: script            # script | llm | hybrid
     script: ./grader.py     # Path to grader script (for script/hybrid types)
+    timeout: 1800           # Grader timeout in seconds (default: 1800)
 
   # Single metric
   metric:
@@ -58,12 +59,12 @@ task:
   # Session phases (optional)
   phases:
     - name: research         # Phase name
-      duration: 30m          # Phase duration (optional — runs until next phase if unset)
+      duration: 30m          # Phase duration (optional, runs until next phase if unset)
       eval_blocked: true     # Block eval submissions during this phase (default: false)
       prompt: "..."          # Override role prompt during this phase (optional)
     - name: evolve           # Final phase (no duration = runs until session ends)
 
-  # Eval queue (optional — without this, evals grade synchronously)
+  # Eval queue (optional, without this evals grade synchronously)
   eval_queue:
     concurrency: 1           # Graders running in parallel (default: 1)
     fairness: round_robin    # fifo | round_robin | priority (default: round_robin)
@@ -112,6 +113,8 @@ agents:
     mcp_servers: []          # MCP servers to configure (default: [])
     env:                     # Extra environment variables (default: {})
       CUSTOM_VAR: value
+    runtime_options:         # Runtime-specific options (default: {})
+      permission_mode: dangerously-skip-permissions  # Maps to --<value> CLI flag
     restart:
       enabled: false         # Auto-restart on crash (default: false)
       max_restarts: 3        # Max restart attempts (default: 3)
@@ -179,9 +182,29 @@ When using multiple metrics, Evolution supports four ranking strategies:
 | `min_rank` | Rank per-metric, use worst rank (penalizes weakness) |
 | `all_must_improve` | Accept only if every metric improves |
 
+## Runtime Options
+
+Each adapter defines default `runtime_options` that can be overridden per-agent. The `permission_mode` value maps 1:1 to the runtime's CLI flag (prepended with `--`):
+
+| Runtime | Default `permission_mode` | CLI flag |
+|---------|--------------------------|----------|
+| `claude-code` | `dangerously-skip-permissions` | `--dangerously-skip-permissions` |
+| `codex` | `dangerously-bypass-approvals-and-sandbox` | `--dangerously-bypass-approvals-and-sandbox` |
+| `opencode` | (none) | (no flag) |
+
+Override per-agent:
+
+```yaml
+agents:
+  cautious-agent:
+    runtime: claude-code
+    runtime_options:
+      permission_mode: enable-auto-mode  # → claude --enable-auto-mode
+```
+
 ## Environment Variables
 
-Agents inherit the parent process environment. The `env` field in agent config adds or overrides specific variables. Sensitive values (API keys) should be in the parent shell environment or a `.env` file in the repo.
+Agents inherit the parent process environment, with `VIRTUAL_ENV`, `PYTHONPATH`, and `PYTHONHOME` stripped to prevent Evolution's own venv from leaking into agent subprocesses. The `env` field in agent config adds or overrides specific variables on top of this cleaned environment. Sensitive values (API keys) should be in the parent shell environment or a `.env` file in the repo.
 
 ## Workspace Strategy
 
@@ -194,7 +217,7 @@ task:
 
 | Strategy | When Used | What Agents Get |
 |----------|-----------|-----------------|
-| `reflink` | APFS (macOS), btrfs/XFS (Linux) | Full copy-on-write clone — source, deps, caches. Near-zero disk cost. |
+| `reflink` | APFS (macOS), btrfs/XFS (Linux) | Full copy-on-write clone: source, deps, caches. Near-zero disk cost. |
 | `git_worktree` | ext4 (Linux), NTFS (Windows) | Git worktree + auto-discovered symlinks for gitignored dirs. |
 | `auto` | Default | Tries reflink first, falls back to git worktree. |
 

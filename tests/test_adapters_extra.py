@@ -64,7 +64,7 @@ class TestCodexProvision:
 
 
 class TestCodexSpawn:
-    def test_spawn_calls_codex_cli(self, tmp_path: Path):
+    def test_spawn_calls_codex_with_default_permission(self, tmp_path: Path):
         adapter = CodexAdapter()
         config = _make_agent_config(env={"CUSTOM": "val"})
 
@@ -76,10 +76,36 @@ class TestCodexSpawn:
             cmd = args[0]
             assert cmd[0] == "codex"
             assert cmd[1] == "exec"
+            assert "--dangerously-bypass-approvals-and-sandbox" in cmd
             assert kwargs["cwd"] == str(tmp_path)
             assert kwargs["env"]["CUSTOM"] == "val"
 
-    def test_spawn_no_env_passes_none(self, tmp_path: Path):
+    def test_spawn_uses_custom_permission_mode(self, tmp_path: Path):
+        adapter = CodexAdapter()
+        config = _make_agent_config(
+            runtime_options={"permission_mode": "full-auto"},
+        )
+
+        with patch("evolution.adapters.codex.subprocess.Popen") as mock_popen:
+            adapter.spawn(tmp_path, config)
+
+            args, _ = mock_popen.call_args
+            cmd = args[0]
+            assert "--full-auto" in cmd
+            assert "--dangerously-bypass-approvals-and-sandbox" not in cmd
+
+    def test_spawn_env_strips_virtual_env(self, tmp_path: Path):
+        adapter = CodexAdapter()
+        config = _make_agent_config(env={"VIRTUAL_ENV": "/bad", "KEEP": "yes"})
+
+        with patch("evolution.adapters.codex.subprocess.Popen") as mock_popen:
+            adapter.spawn(tmp_path, config)
+
+            _, kwargs = mock_popen.call_args
+            assert "VIRTUAL_ENV" not in kwargs["env"]
+            assert kwargs["env"]["KEEP"] == "yes"
+
+    def test_spawn_empty_env_still_cleans(self, tmp_path: Path):
         adapter = CodexAdapter()
         config = _make_agent_config(env={})
 
@@ -87,7 +113,8 @@ class TestCodexSpawn:
             adapter.spawn(tmp_path, config)
 
             _, kwargs = mock_popen.call_args
-            assert kwargs["env"] is None
+            assert isinstance(kwargs["env"], dict)
+            assert "VIRTUAL_ENV" not in kwargs["env"]
 
 
 class TestOpenCodeAdapterAttributes:
@@ -140,7 +167,18 @@ class TestOpenCodeSpawn:
             assert kwargs["cwd"] == str(tmp_path)
             assert kwargs["env"]["KEY"] == "value"
 
-    def test_spawn_no_env_passes_none(self, tmp_path: Path):
+    def test_spawn_env_strips_virtual_env(self, tmp_path: Path):
+        adapter = OpenCodeAdapter()
+        config = _make_agent_config(runtime="opencode", env={"VIRTUAL_ENV": "/bad", "KEY": "val"})
+
+        with patch("evolution.adapters.opencode.subprocess.Popen") as mock_popen:
+            adapter.spawn(tmp_path, config)
+
+            _, kwargs = mock_popen.call_args
+            assert "VIRTUAL_ENV" not in kwargs["env"]
+            assert kwargs["env"]["KEY"] == "val"
+
+    def test_spawn_empty_env_still_cleans(self, tmp_path: Path):
         adapter = OpenCodeAdapter()
         config = _make_agent_config(runtime="opencode", env={})
 
@@ -148,4 +186,5 @@ class TestOpenCodeSpawn:
             adapter.spawn(tmp_path, config)
 
             _, kwargs = mock_popen.call_args
-            assert kwargs["env"] is None
+            assert isinstance(kwargs["env"], dict)
+            assert "VIRTUAL_ENV" not in kwargs["env"]
